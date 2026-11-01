@@ -1,0 +1,1 @@
+"""FunPay BOT application package."""

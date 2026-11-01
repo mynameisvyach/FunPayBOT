@@ -1,0 +1,17 @@
+{
+  "repository": "https://github.com/sidor0912/FunPayCardinal",
+  "tag": "v0.1.17.15",
+  "revision": "c09dd13be25072bb3d5cdbba33d1e0d70e477710",
+  "sha256": {
+    "FunPayAPI/__init__.py": "126df8d33be3cc6d97a8f3e62237eef0666fc89817a4c23885c559d70352febf",
+    "FunPayAPI/account.py": "c309667049b200106d8ee3d9589f2dea94725b141ab27df2d2ef0371be798afd",
+    "FunPayAPI/common/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "FunPayAPI/common/enums.py": "8f8fbd83850b59f661196be23a38634ae0d834d37327b2e30ccf75ec3acf55f2",
+    "FunPayAPI/common/exceptions.py": "4294eb14189db7ff4007c8cf024c144c24e57f53f2c212c054d638b0ec41f9fd",
+    "FunPayAPI/common/utils.py": "f556fd21ea07ad7dab79e34dd7fb158d120efc48dcea9c8a77d28af886f3018c",
+    "FunPayAPI/types.py": "cb5daf83a3226bce87b6b90d40a77620423fada3710bfa4757d35d1eb19a8f88",
+    "FunPayAPI/updater/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "FunPayAPI/updater/events.py": "3c29e31ee96ebb8a96f2cf78058d2bb515d8c24a616e957642894b0d4661656b",
+    "FunPayAPI/updater/runner.py": "35e239318ed9e2f2f23feca79ad9f1c8a993ba004ee359d75de6a1aee7d58b52"
+  }
+}

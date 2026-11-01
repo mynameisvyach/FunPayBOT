@@ -1,0 +1,133 @@
+{
+  "general": {
+    "timezone": "Europe/Moscow",
+    "schema_version": "3"
+  },
+  "telegram": {
+    "token": "YOUR-BOT-TOKEN",
+    "group_id": "YOUR-GROUP-ID",
+    "owner_id": "YOUR-OWNER-ID",
+    "admin_ids": [],
+    "proxy": ""
+  },
+  "funpay": {
+    "golden_key": "YOUR-GOLDEN-KEY",
+    "user_agent": "YOUR-USER-AGENT",
+    "proxy": "",
+    "poll_seconds": "6"
+  },
+  "plugins": {
+    "enabled": "auto"
+  },
+  "sellerstatus": {
+    "enabled": true,
+    "online": true,
+    "command": "#status"
+  },
+  "autoraise": {
+    "enabled": false,
+    "interval_seconds": "3600"
+  },
+  "autowithdraw": {
+    "enabled": false,
+    "method": "card_rub",
+    "method_kind": "card",
+    "wallet": "YOUR-WITHDRAWAL-WALLET",
+    "minimum": "1000",
+    "reserve": "0",
+    "interval_seconds": "300",
+    "scope": "available_balance",
+    "manual_amount": "all"
+  },
+  "finance": {
+    "balance_lot_id": "0",
+    "hold_enabled": true,
+    "hold_hours": "48",
+    "withdraw_notifications": true
+  },
+  "notifications": {
+    "autoresponse": true,
+    "new_order": true,
+    "order_status": true,
+    "review": true,
+    "lot_manager": true,
+    "delivery": true,
+    "ticket": true,
+    "withdrawal": true,
+    "auto_raise": true
+  },
+  "ratingrestrictions": {
+    "enabled": true
+  },
+  "statistics": {
+    "rmthub_enabled": false,
+    "rmthub_cache_minutes": "60"
+  },
+  "autogreetings": {
+    "enabled": false,
+    "default_text": "Здравствуйте! Напишите, если нужна помощь.",
+    "cooldown_hours": "48",
+    "only_new_chats": false,
+    "lot_greetings": {}
+  },
+  "autoresponse": {
+    "commands": {},
+    "notification_text": "Покупатель {username} вызвал автоответ."
+  },
+  "confirmationreply": {
+    "enabled": false,
+    "text": "Спасибо за подтверждение заказа!"
+  },
+  "confirmreminder": {
+    "enabled": false,
+    "text": "Если заказ получен, подтвердите его выполнение на FunPay.",
+    "delay_hours": "24"
+  },
+  "reviewreminder": {
+    "enabled": false,
+    "text": "Будем благодарны за отзыв о заказе.",
+    "delay_hours": "24"
+  },
+  "reviewreply": {
+    "enabled": false
+  },
+  "reviewchatreply": {
+    "enabled": false,
+    "on_feedback_changed": false
+  },
+  "autoticket": {
+    "enabled": false,
+    "hour": "12",
+    "message": "1) {clear_orders}\n\n2) {ambiguous_orders}"
+  },
+  "chattemplates": {
+    "items": {}
+  },
+  "messages": {
+    "watermark": false,
+    "watermark_text": "[Бот]"
+  },
+  "rates": {
+    "enabled": false,
+    "interval_seconds": "3600"
+  },
+  "weeklyreport": {
+    "enabled": false,
+    "weekday": "0",
+    "hour": "10"
+  },
+  "debug": {
+    "refresh_seconds": "10",
+    "enabled": false
+  },
+  "logging": {
+    "level": "INFO",
+    "max_bytes": "5000000",
+    "backup_count": "3"
+  },
+  "autodump": {
+    "enabled": false,
+    "interval_seconds": "60",
+    "lots": {}
+  }
+}
