@@ -1,1 +1,1 @@
-"""FunPay BOT application package."""
+"""Пакет приложения FunPay BOT."""

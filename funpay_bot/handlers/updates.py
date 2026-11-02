@@ -1,7 +1,8 @@
-"""Updates application handlers."""
+"""Обработка сообщений Telegram, нажатий и команд."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -9,14 +10,64 @@ import time
 from decimal import Decimal
 
 from ..finance import FinancialLedger, WithdrawalCosts, money
-from ..framework import (
-    plugin_capability,
-)
+from ..logging_setup import log_event_reception
 from ..metadata import LOG, TITLES
-from ..telegram import DemoTelegram
 
 
 class UpdatesMixin:
+    async def acknowledge_callback(self, callback_id, text=None):
+        """Подтверждает нажатие с коротким ожиданием, не отменяя действие при сбое Telegram."""
+        try:
+            await asyncio.wait_for(
+                self.tg.call(
+                    "answer_callback_query",
+                    callback_query_id=callback_id,
+                    **({"text": text} if text else {}),
+                ),
+                timeout=3,
+            )
+        except Exception as error:
+            name = type(error).__name__
+            if name == "TelegramBadRequest" and any(
+                part in str(error).lower()
+                for part in (
+                    "query is too old",
+                    "query id is invalid",
+                    "query_id_invalid",
+                    "response timeout expired",
+                )
+            ):
+                LOG.debug("Telegram не принял подтверждение устаревшего нажатия")
+                return
+            if isinstance(error, TimeoutError) or name in (
+                "TelegramNetworkError",
+                "TelegramRetryAfter",
+            ):
+                if time.monotonic() - getattr(self, "_callback_warning_at", 0) > 60:
+                    self._callback_warning_at = time.monotonic()
+                    LOG.warning(
+                        "Не удалось подтвердить нажатие в Telegram; действие обрабатывается"
+                    )
+                return
+            raise
+
+    async def report_plugin_error(self, topic, error):
+        """Пытается показать ошибку без повторного исключения при недоступном Telegram."""
+        text = (
+            error.short_str()
+            if callable(getattr(error, "short_str", None))
+            else str(error)
+            if isinstance(error, ValueError)
+            else "Не удалось выполнить действие. Подробности в журнале."
+        )
+        try:
+            await asyncio.wait_for(self.say(topic, text), timeout=5)
+        except Exception as delivery_error:
+            LOG.warning(
+                "Не удалось отправить уведомление об ошибке плагина в Telegram (%s); подробности в журнале",
+                type(delivery_error).__name__,
+            )
+
     def allowed(self, message, user_id, *, callback=False):
         chat = message.get("chat", {})
         if chat.get("id") != self.group or chat.get("type") != "supergroup":
@@ -47,14 +98,18 @@ class UpdatesMixin:
         message = (call or {}).get("message") if call else update.get("message")
         if not message:
             return
+        if not call and message.get("pinned_message"):
+            await self.remove_own_pin_notice(message)
+            return
         sender = (call or message).get("from", {})
         anonymous = not call and bool(message.get("sender_chat"))
         if sender.get("is_bot") and not anonymous:
             return
         if not self.allowed(message, sender.get("id"), callback=bool(call)):
             return
+        self.record_human_activity("Telegram")
         if anonymous:
-            LOG.info("Управление от имени настроенной группы: %s", self.group)
+            LOG.debug("Управление от имени настроенной группы")
         # The only personal control session belongs to the owner. Anonymous group
         # messages may fill its forms; callbacks still require the real owner ID.
         sender = {"id": self.cfg.owner_id}
@@ -65,11 +120,12 @@ class UpdatesMixin:
             if name in ("backup", "proxy", "golden_key", "restart"):
                 await self.service_command(name, sender["id"])
                 return
-            if name == "lot_tools":
-                await self.central_lot_menu("lot_tools")
+            if name == "lots":
+                await self.management_callback("lots_menu", sender["id"])
                 return
             if name in self.plugins:
                 plugin = self.plugins[name]
+                self.reopen_plugin_menu(name)
                 if hasattr(plugin, "menu"):
                     await plugin.menu(new_message=True)
                 else:
@@ -82,7 +138,26 @@ class UpdatesMixin:
         if not call and topic == "main" and await self.service_input(message, user):
             return
         if call:
-            await self.tg.call("answer_callback_query", callback_query_id=call["id"])
+            call["data"] = self.decode_callback(call.get("data", ""))
+            callback_notice = None
+            if ":" in call["data"]:
+                plugin_name, plugin_action = call["data"].split(":", 1)
+                plugin = self.plugins.get(plugin_name)
+                notice = getattr(plugin, "callback_notice", None)
+                if (
+                    notice
+                    and topic == "plugin:" + plugin_name
+                    and message.get("message_id")
+                    == self.state.d["cards"].get(topic + "/menu")
+                ):
+                    callback_notice = notice(plugin_action)
+            await self.acknowledge_callback(call["id"], callback_notice)
+            if call.get("data") == "rates:refresh":
+                if topic == "main" and message.get("message_id") == self.state.d[
+                    "cards"
+                ].get("main/rates"):
+                    await self.rates(force=True)
+                return
             data = call.get("data", "")
             if await self.service_callback(data, user, topic, message):
                 return
@@ -140,24 +215,13 @@ class UpdatesMixin:
                         await self.close_ui_message(message, topic, user)
                         return
 
-                    if not plugin_capability(self.plugins[name], "commerce"):
-                        logging.getLogger("unified.plugins." + name).info(
-                            "Действие меню: %s; администратор=%s",
-                            action.split(":", 1)[0],
-                            user,
-                        )
                     try:
                         await self.plugins[name].callback(action, user)
                     except Exception as error:
-                        logging.getLogger("unified.plugins." + name).exception(
+                        logging.getLogger("FunPayBOT.plugins." + name).exception(
                             "Ошибка меню плагина: %s", action
                         )
-                        await self.say(
-                            topic,
-                            str(error)
-                            if isinstance(error, ValueError)
-                            else "Не удалось выполнить действие. Подробности в журнале.",
-                        )
+                        await self.report_plugin_error(topic, error)
                 return
             if topic.startswith("chat:"):
                 chat = topic[5:]
@@ -193,9 +257,7 @@ class UpdatesMixin:
             text = message.get("text", "")
             if topic == "main":
                 command = text.split("@", 1)[0].split(" ", 1)[0]
-                if command == "/debug":
-                    await self.toggle_debug()
-                elif command == "/menu":
+                if command == "/menu":
                     self.pending.pop(user, None)
                     await self.menu(new_message=True)
                 elif user in self.pending:
@@ -288,6 +350,7 @@ class UpdatesMixin:
                     and text.split("@", 1)[0].split(" ", 1)[0] == "/menu"
                 ):
                     plugin = self.plugins[name]
+                    self.reopen_plugin_menu(name)
                     if hasattr(plugin, "menu"):
                         await plugin.menu(new_message=True)
                     else:
@@ -300,17 +363,17 @@ class UpdatesMixin:
                     and hasattr(self.plugins[name], "document")
                 ):
                     doc = message["document"]
-                    if doc.get("file_size", 0) > (
-                        40_000_000 if name == "lot_tools" else 1_000_000
-                    ):
+                    if doc.get("file_size", 0) > 1_000_000:
                         await self.say(topic, "Файл слишком большой для этого плагина.")
-                        return
-                    if isinstance(self.tg, DemoTelegram):
                         return
                     body = await self.tg.bot.download(doc["file_id"])
                     await self.plugins[name].document(
                         doc.get("file_name", ""), body.read(), user
                     )
+                elif name in self.plugins and callable(
+                    getattr(self.plugins[name], "telegram_message", None)
+                ):
+                    await self.plugins[name].telegram_message(message, user)
                 elif name in self.plugins and hasattr(self.plugins[name], "message"):
                     await self.plugins[name].message(text, user)
             elif topic.startswith("chat:"):
@@ -366,6 +429,8 @@ class UpdatesMixin:
                     "Сначала выберите способ и сохранённые реквизиты в разделе вывода"
                 )
             self.cfg.set(section, key, not self.cfg.flag(section, key))
+            if section == "SellerStatus" and key == "online":
+                log_event_reception(self.cfg)
             if section == "AutoWithdraw":
                 await self.withdraw_menu()
             elif section == "SellerStatus" and key == "enabled":
@@ -396,18 +461,8 @@ class UpdatesMixin:
                 "menu",
                 f"✏ {section} / {key}\nПришлите новое значение в эту тему. Для отмены — /menu.\n\nСейчас:\n{self.cfg.get(section, key)}",
             )
-        elif data == "demo" and self.fp.mode == "demo":
-            await self.handle_event(
-                {
-                    "kind": "message",
-                    "id": "demo:" + str(time.time_ns()),
-                    "chat": "101",
-                    "username": "DemoBuyer",
-                    "text": "!help",
-                }
-            )
         elif data == "reload_plugins":
-            await self.reload_plugins()
+            await self.reload_plugins(force=True)
             await self.menu("plugins")
         elif data == "rates":
             await self.rates()

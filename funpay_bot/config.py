@@ -1,4 +1,4 @@
-"""Config services."""
+"""Загрузка, проверка и сохранение JSON-настроек."""
 
 from __future__ import annotations
 
@@ -66,11 +66,17 @@ def settings_payload(parser):
 
 
 DEFAULTS = {
-    "General": {"timezone": "Europe/Moscow", "schema_version": "3"},
+    "General": {"timezone": "Europe/Moscow"},
     "Telegram": {"token": "", "group_id": "0", "owner_id": "0", "proxy": ""},
     "FunPay": {"golden_key": "", "user_agent": "", "proxy": "", "poll_seconds": "6"},
     "Plugins": {"enabled": "auto"},
-    "SellerStatus": {"enabled": "true", "online": "true", "command": "#status"},
+    "SellerStatus": {
+        "enabled": "true",
+        "online": "true",
+        "command": "#status",
+        "active_text": "",
+        "unknown_text": "",
+    },
     "AutoRaise": {"enabled": "false", "interval_seconds": "3600"},
     "AutoWithdraw": {
         "enabled": "false",
@@ -86,7 +92,6 @@ DEFAULTS = {
     "Finance": {
         "balance_lot_id": "0",
         "hold_enabled": "true",
-        "hold_hours": "48",
         "withdraw_notifications": "true",
     },
     "Notifications": {
@@ -107,27 +112,27 @@ DEFAULTS = {
     "Statistics": {"rmthub_enabled": "false", "rmthub_cache_minutes": "60"},
     "AUTOGREETINGS": {
         "enabled": "false",
-        "default_text": "Здравствуйте! Напишите, если нужна помощь.",
+        "default_text": "",
         "cooldown_hours": "48",
         "only_new_chats": "false",
         "lot_greetings": "{}",
     },
     "AUTORESPONSE": {
         "commands": "{}",
-        "notification_text": "Покупатель {username} вызвал автоответ.",
+        "notification_text": "",
     },
     "CONFIRMATIONREPLY": {
         "enabled": "false",
-        "text": "Спасибо за подтверждение заказа!",
+        "text": "",
     },
     "CONFIRMREMINDER": {
         "enabled": "false",
-        "text": "Если заказ получен, подтвердите его выполнение на FunPay.",
+        "text": "",
         "delay_hours": "24",
     },
     "REVIEWREMINDER": {
         "enabled": "false",
-        "text": "Будем благодарны за отзыв о заказе.",
+        "text": "",
         "delay_hours": "24",
     },
     "REVIEWREPLY": {"enabled": "false"},
@@ -135,13 +140,13 @@ DEFAULTS = {
     "AUTOTICKET": {
         "enabled": "false",
         "hour": "12",
-        "message": "1) {clear_orders}\n\n2) {ambiguous_orders}",
+        "message": "",
     },
     "ChatTemplates": {"items": "{}"},
-    "Messages": {"watermark": "false", "watermark_text": "[Бот]"},
+    "Fulfillment": {"text": "", "receipt_text": ""},
+    "Messages": {"watermark": "false", "watermark_text": ""},
     "Rates": {"enabled": "false", "interval_seconds": "3600"},
     "WeeklyReport": {"enabled": "false", "weekday": "0", "hour": "10"},
-    "Debug": {"enabled": "false", "refresh_seconds": "10"},
     "Logging": {"level": "INFO", "max_bytes": "5000000", "backup_count": "3"},
 }
 

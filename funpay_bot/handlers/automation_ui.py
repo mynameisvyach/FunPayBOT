@@ -1,4 +1,4 @@
-"""Automation ui application handlers."""
+"""Редактор настроек автоматизации."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from ..metadata import TITLES
 
 class AutomationUIMixin:
     AUTO_HELP = {
+        "Fulfillment": "Общее сообщение о выполнении заказа: продавец и плагины используют один текст; подтверждение операции добавляется отдельно.",
         "AUTOGREETINGS": "Отправляет приветствие после сообщения покупателя или нового оплаченного заказа. Повтор ограничен паузой. Для лота с подходящим описанием используется его текст, иначе — общий. На сообщения продавца, системы и поддержки не отвечает.",
         "AUTORESPONSE": "Отвечает на точную команду покупателя, без учёта регистра. Общего выключателя нет. Заготовки продавца настраиваются отдельно и доступны кнопками в закрепах чатов.",
         "CONFIRMATIONREPLY": "Отправляет сообщение в чат, когда покупатель подтверждает выполнение заказа. Для одного заказа ответ отправляется один раз.",
@@ -27,6 +28,10 @@ class AutomationUIMixin:
     }
 
     AUTO_FIELDS = {
+        "Fulfillment": {
+            "text": ("Сообщение покупателю", "text"),
+            "receipt_text": ("Дополнение с чеком", "text"),
+        },
         "AUTOGREETINGS": {
             "default_text": ("Общее приветствие", "text"),
             "cooldown_hours": ("Пауза между приветствиями, ч", "hours"),
@@ -111,7 +116,7 @@ class AutomationUIMixin:
         )
         text = title + "\n\n" + self.AUTO_HELP[section]
         rows = []
-        if section not in ("AUTORESPONSE", "ChatTemplates", "Messages"):
+        if section not in ("AUTORESPONSE", "ChatTemplates", "Messages", "Fulfillment"):
             rows.append(
                 [
                     (

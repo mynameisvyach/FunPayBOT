@@ -1,13 +1,11 @@
 {
   "general": {
-    "timezone": "Europe/Moscow",
-    "schema_version": "3"
+    "timezone": "Europe/Moscow"
   },
   "telegram": {
     "token": "YOUR-BOT-TOKEN",
     "group_id": "YOUR-GROUP-ID",
     "owner_id": "YOUR-OWNER-ID",
-    "admin_ids": [],
     "proxy": ""
   },
   "funpay": {
@@ -22,7 +20,9 @@
   "sellerstatus": {
     "enabled": true,
     "online": true,
-    "command": "#status"
+    "command": "#status",
+    "active_text": "◷ Последняя активность продавца: {last_activity}.\n\nДля личного обращения напишите: помощь.",
+    "unknown_text": "◷ Пока нет отметки о последней активности продавца.\n\nНужен ответ по заказу? Напишите: помощь."
   },
   "autoraise": {
     "enabled": false,
@@ -32,7 +32,7 @@
     "enabled": false,
     "method": "card_rub",
     "method_kind": "card",
-    "wallet": "YOUR-WITHDRAWAL-WALLET",
+    "wallet": "",
     "minimum": "1000",
     "reserve": "0",
     "interval_seconds": "300",
@@ -42,7 +42,6 @@
   "finance": {
     "balance_lot_id": "0",
     "hold_enabled": true,
-    "hold_hours": "48",
     "withdraw_notifications": true
   },
   "notifications": {
@@ -64,51 +63,135 @@
     "rmthub_cache_minutes": "60"
   },
   "autogreetings": {
-    "enabled": false,
-    "default_text": "Здравствуйте! Напишите, если нужна помощь.",
+    "enabled": true,
+    "default_text": "✦ Добро пожаловать, {username}!\n\nВыберите предложение в магазине или напишите, что хотите уточнить. Условия получения указаны на странице товара.\n\nпомощь — обратиться к продавцу\n#status — посмотреть его последнюю активность",
     "cooldown_hours": "48",
     "only_new_chats": false,
-    "lot_greetings": {}
+    "lot_greetings": {
+      "Цифровой товар, {} единиц, По идентификатору": "✦ Вы выбрали: {order_desc_or_params}.\n\nПеред покупкой проверьте описание и нужное количество. Если требуется уточнение, напишите вопрос в этом чате.\n\nСвязь с продавцом: помощь."
+    }
   },
   "autoresponse": {
-    "commands": {},
-    "notification_text": "Покупатель {username} вызвал автоответ."
+    "commands": {
+      "помощь": {
+        "enabled": true,
+        "trigger_author": "buyer",
+        "response": "✦ Обращение к продавцу отмечено.\n\nОпишите вопрос одним сообщением; если он касается покупки, укажите номер заказа.\n\nПоследнюю активность продавца можно посмотреть командой #status.",
+        "notify": true
+      }
+    },
+    "notification_text": "✦ {username} обратился к продавцу.\nЧат FunPay: {chat_id}\nСообщение: {message_text}"
   },
   "confirmationreply": {
     "enabled": false,
-    "text": "Спасибо за подтверждение заказа!"
+    "text": "✦ Заказ #{order_id} завершён. Спасибо, {username}!\n\nБудем рады вашему отзыву о покупке. Если появится вопрос, напишите в этот чат."
   },
   "confirmreminder": {
     "enabled": false,
-    "text": "Если заказ получен, подтвердите его выполнение на FunPay.",
+    "text": "✦ Небольшое напоминание по заказу #{order_id}.\n\nЕсли результат получен и всё в порядке, подтвердите выполнение на странице заказа. Если возникла проблема, сначала расскажите о ней здесь.",
     "delay_hours": "24"
   },
   "reviewreminder": {
     "enabled": false,
-    "text": "Будем благодарны за отзыв о заказе.",
+    "text": "✦ Как прошла покупка по заказу #{order_id}?\n\nЕсли найдётся минутка, оставьте отзыв на странице заказа. Обратная связь помогает сделать сервис удобнее.",
     "delay_hours": "24"
   },
   "reviewreply": {
-    "enabled": false
+    "enabled": false,
+    "1": {
+      "enable": true,
+      "text": "✦ Спасибо за обратную связь. Хотим разобраться в ситуации: пожалуйста, опишите проблему в чате заказа."
+    },
+    "2": {
+      "enable": true,
+      "text": "✦ Спасибо, что поделились впечатлением. Напишите в чат заказа, что именно не устроило, чтобы продавец мог проверить детали."
+    },
+    "3": {
+      "enable": true,
+      "text": "✦ Благодарим за отзыв. Если покупку можно было сделать удобнее, расскажите об этом в чате заказа."
+    },
+    "4": {
+      "enable": true,
+      "text": "✦ Благодарим за покупку и отзыв! Учтём ваши пожелания."
+    },
+    "5": {
+      "enable": true,
+      "text": "✦ Спасибо за доверие и высокую оценку! Будем рады видеть вас снова."
+    }
   },
   "reviewchatreply": {
     "enabled": false,
-    "on_feedback_changed": false
+    "on_feedback_changed": false,
+    "1": {
+      "enable": true,
+      "text": "✦ Спасибо за обратную связь. Хотим разобраться в ситуации: пожалуйста, опишите проблему в чате заказа."
+    },
+    "2": {
+      "enable": true,
+      "text": "✦ Спасибо, что поделились впечатлением. Напишите в чат заказа, что именно не устроило, чтобы продавец мог проверить детали."
+    },
+    "3": {
+      "enable": true,
+      "text": "✦ Благодарим за отзыв. Если покупку можно было сделать удобнее, расскажите об этом в чате заказа."
+    },
+    "4": {
+      "enable": true,
+      "text": "✦ Благодарим за покупку и отзыв! Учтём ваши пожелания."
+    },
+    "5": {
+      "enable": true,
+      "text": "✦ Спасибо за доверие и высокую оценку! Будем рады видеть вас снова."
+    }
   },
   "autoticket": {
     "enabled": false,
     "hour": "12",
-    "message": "1) {clear_orders}\n\n2) {ambiguous_orders}"
+    "message": "1) {clear_orders}\n\n2) {ambiguous_orders}\n\nДобрый день! Просим рассмотреть подтверждение перечисленных заказов. В первом списке — выполненные заказы без признаков претензий; во втором — ситуации, требующие отдельного рассмотрения."
   },
   "chattemplates": {
-    "items": {}
+    "items": {
+      "welcome": {
+        "title": "На связи",
+        "text": "✦ Здравствуйте, {username}! Я на связи. Расскажите, что хотите уточнить.",
+        "enabled": true
+      },
+      "details": {
+        "title": "Уточнить детали",
+        "text": "✦ Чтобы проверить ситуацию, пришлите номер заказа и коротко опишите, на каком шаге возник вопрос.",
+        "enabled": true
+      },
+      "checking": {
+        "title": "Проверяю",
+        "text": "✦ Вопрос вижу, сейчас проверяю детали. Пожалуйста, дождитесь ответа в этом чате.",
+        "enabled": true
+      },
+      "result": {
+        "title": "Проверить результат",
+        "text": "✦ Проверьте, пожалуйста, результат покупки. Если всё получено, можно подтвердить заказ; если есть вопрос — напишите его здесь.",
+        "enabled": true
+      },
+      "thanks": {
+        "title": "Благодарность",
+        "text": "✦ Благодарю за покупку, {username}! Хорошего дня и до новых встреч.",
+        "enabled": true
+      },
+      "pause": {
+        "title": "Нужно время",
+        "text": "✦ Для проверки потребуется немного времени. Вернусь с ответом в этот чат, как только уточню детали.",
+        "enabled": true
+      }
+    }
+  },
+  "fulfillment": {
+    "text": "✦ {username}, работа по заказу #{order_id} выполнена.\n\nПроверьте результат. Если всё в порядке, подтвердите выполнение на странице заказа. Если нужна помощь, напишите в этот чат.",
+    "receipt_text": "✦ Подтверждение операции\n{reference}\n{receipt_url}"
   },
   "messages": {
-    "watermark": false,
-    "watermark_text": "[Бот]"
+    "watermark": true,
+    "watermark_text": "🤖 FunPay BOT · Связь с продавцом: помощь"
   },
   "rates": {
-    "enabled": false,
+    "enabled": true,
     "interval_seconds": "3600"
   },
   "weeklyreport": {
@@ -116,18 +199,9 @@
     "weekday": "0",
     "hour": "10"
   },
-  "debug": {
-    "refresh_seconds": "10",
-    "enabled": false
-  },
   "logging": {
     "level": "INFO",
     "max_bytes": "5000000",
     "backup_count": "3"
-  },
-  "autodump": {
-    "enabled": false,
-    "interval_seconds": "60",
-    "lots": {}
   }
 }

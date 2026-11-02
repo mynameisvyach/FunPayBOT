@@ -1,4 +1,4 @@
-"""Orders application handlers."""
+"""Карточки заказов, их история и действия продавца."""
 
 from __future__ import annotations
 
@@ -130,6 +130,8 @@ class OrdersMixin:
         phase = (
             "Средства возвращены"
             if row["status"] == "REFUNDED"
+            else "Выполнен · подтверждён покупателем"
+            if row["status"] == "CLOSED"
             else "Выполнен вручную"
             if row.get("fulfilled", {}).get("source") == "manual"
             else row.get("progress_text")
@@ -167,8 +169,9 @@ class OrdersMixin:
             )
             text = pages[page]
             buttons = []
+            terminal = row["status"] in ("CLOSED", "REFUNDED")
             e = row["event"]
-            if len(pages) > 1:
+            if len(pages) > 1 and not terminal:
                 text += f"\nИстория: {page + 1}/{len(pages)}"
                 buttons.append(
                     [
@@ -196,7 +199,7 @@ class OrdersMixin:
                         {"text": "Отмена", "callback_data": f"ord:{key}:cancel"},
                     ]
                 )
-            elif row["status"] in ("PAID", "CLOSED"):
+            elif row["status"] == "PAID":
                 if (
                     not row.get("refund_pending")
                     and not row.get("plugin")
@@ -265,6 +268,24 @@ class OrdersMixin:
 
                 if not await self.once("ordercard:" + key, create, notify=False):
                     return
+            if terminal and len(pages) > 1:
+                for index, history in enumerate(pages[:-1]):
+
+                    async def send_history(history=history):
+                        await self.tg.call(
+                            "send_message",
+                            chat_id=self.group,
+                            message_thread_id=self.state.d["topics"]["orders"],
+                            reply_to_message_id=self.state.d["cards"][cardkey],
+                            text=history,
+                            allow_sending_without_reply=True,
+                        )
+
+                    action = f"archive:{key}:history:{index}"
+                    if action not in self.state.d["actions"]:
+                        await self.once(action, send_history, notify=False)
+                    if self.state.d["actions"].get(action, {}).get("status") != "done":
+                        return
             row.update(rendered_revision=revision, render_signature=signature)
             self.state.save()
 
@@ -302,6 +323,19 @@ class OrdersMixin:
                 current = await self.fp.verify_order(key)
                 if current["chat"] != row["event"]["chat"]:
                     raise ValueError("Чат заказа не совпадает")
+                row["event"].update(
+                    {
+                        name: current[name]
+                        for name in (
+                            "order_desc",
+                            "order_params",
+                            "category_name",
+                            "category_fullname",
+                            "game",
+                        )
+                        if name in current
+                    }
+                )
                 if current["status"] != row["status"]:
                     await self.handle_event(
                         {

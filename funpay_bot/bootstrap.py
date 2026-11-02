@@ -1,4 +1,4 @@
-"""CLI, dependency setup and application startup."""
+"""Аргументы командной строки, настройка зависимостей и запуск приложения."""
 
 from __future__ import annotations
 
@@ -18,9 +18,10 @@ from zoneinfo import ZoneInfo
 
 from .commerce import CommercePlugin
 from .config import DEFAULTS, Config, is_placeholder, load_parser, settings_payload
+from .dependencies import StartupError, ensure_runtime_dependencies
 from .framework import configured_plugin_names, load_plugin_module
 from .logging_setup import setup_logs
-from .metadata import API_REVISION, BOT_NAME, LOG, ROOT
+from .metadata import API_REVISION, LOG, ROOT
 from .storage import SingleProcess, State, atomic_write
 from .telegram import Telegram
 
@@ -39,27 +40,12 @@ async def live(cfg, state):
             raise ValueError("Нужна супергруппа с включёнными темами")
         await tg.bot.delete_webhook(drop_pending_updates=False)
         me = await tg.bot.get_me()
-        try:
-            await tg.bot.set_my_name(name=BOT_NAME)
-        except Exception:
-            LOG.warning(
-                "Не удалось обновить имя Telegram-бота; локальное имя — %s", BOT_NAME
-            )
         member = await tg.bot.get_chat_member(app.group, me.id)
         if member.status != "administrator" or not member.can_manage_topics:
             raise ValueError("Боту нужны права администратора с управлением темами")
-        from aiogram.types import (
-            BotCommandScopeAllGroupChats,
-            BotCommandScopeAllPrivateChats,
-            BotCommandScopeDefault,
-        )
+        from .telegram_profile import reset_profile
 
-        for scope in (
-            BotCommandScopeDefault(),
-            BotCommandScopeAllPrivateChats(),
-            BotCommandScopeAllGroupChats(),
-        ):
-            await tg.bot.delete_my_commands(scope=scope)
+        await reset_profile(tg.bot, cfg, state, app.group)
         await fp.start()
         identity = {
             "bot_id": me.id,
@@ -68,6 +54,9 @@ async def live(cfg, state):
         if state.d.get("identity", identity) != identity:
             raise ValueError("state.json принадлежит другому боту или аккаунту FunPay")
         state.d["identity"] = identity
+        cleaned = state.cleanup_startup()
+        if cleaned:
+            LOG.info("Служебное состояние очищено: записей=%s", cleaned)
         state.save()
         for event in getattr(fp, "initial_events", []):
             if event["kind"] == "baseline":
@@ -76,6 +65,12 @@ async def live(cfg, state):
                 state.d["inbox"].setdefault(event["id"], event)
         state.save()
         await app.boot()
+        if app.restart_requested:
+            return True
+        LOG.info("Готов к работе")
+        from .logging_setup import start_banner_animation
+
+        start_banner_animation()
 
         async def poll_fp():
             previous_online = None
@@ -84,7 +79,7 @@ async def live(cfg, state):
                 try:
                     online = cfg.flag("SellerStatus", "online")
                     if online != previous_online:
-                        LOG.info(
+                        LOG.debug(
                             "Опрос FunPay: %s",
                             "включён"
                             if online
@@ -93,7 +88,7 @@ async def live(cfg, state):
                         previous_online = online
                     if not online and time.monotonic() - last_offline_log >= 60:
                         last_offline_log = time.monotonic()
-                        LOG.info(
+                        LOG.debug(
                             "Офлайн: новые события FunPay не запрашиваются; Telegram продолжает работать"
                         )
                     if online:
@@ -171,130 +166,8 @@ async def live(cfg, state):
     return app.restart_requested
 
 
-class StartupError(RuntimeError):
-    """A safe, user-readable startup diagnosis without secret values."""
-
-
-def dependency_issues():
-    """Inspect declared package versions first; configuration is not read here."""
-    from importlib import import_module, metadata
-
-    path = ROOT / "requirements.txt"
-    if not path.is_file():
-        raise StartupError(
-            "Не найден requirements.txt. Восстановите файл из полного релиза; конфиги менять не нужно."
-        )
-    issues = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        match = re.fullmatch(r"([A-Za-z0-9_.-]+)==([^\s;]+)", line)
-        if not match:
-            raise StartupError(
-                "Неподдерживаемая запись requirements.txt: требуется закреплённая версия name==version"
-            )
-        name, expected = match.groups()
-        try:
-            actual = metadata.version(name)
-        except metadata.PackageNotFoundError:
-            actual = None
-        if actual != expected:
-            issues.append(
-                {
-                    "kind": "missing" if actual is None else "version",
-                    "package": name,
-                    "expected": expected,
-                }
-            )
-    if issues:
-        return issues
-    for module in (
-        "aiogram",
-        "requests",
-        "requests_toolbelt",
-        "bs4",
-        "lxml.etree",
-        "PIL.Image",
-        "aiohttp_socks",
-        "matplotlib.pyplot",
-    ):
-        try:
-            import_module(module)
-        except Exception:
-            issues.append({"kind": "import", "package": module})
-    return issues
-
-
-def ensure_runtime_dependencies():
-    """Repair packages independently of settings, then restart the same startup mode."""
-    import subprocess
-
-    if sys.version_info < (3, 11):
-        raise StartupError(
-            "Нужен Python 3.11 или новее, рекомендуется 3.12. Конфиги не изменялись."
-        )
-    issues = dependency_issues()
-    flag = "FUNPAY_BOT_DEPENDENCY_REPAIR"
-    if not issues:
-        os.environ.pop(flag, None)
-        print("Проверка пакетов: OK.")
-        return True
-    names = ", ".join(sorted({row["package"] for row in issues}))
-    print("Не готовы зависимости Python: " + names)
-    print("Это проверка пакетов, а не ошибка настроенных конфигов.")
-    if os.environ.get(flag) == "1":
-        raise StartupError(
-            "Пакеты после установки не прошли проверку: "
-            + names
-            + ". Конфиги не изменялись."
-        )
-    if sys.prefix == sys.base_prefix:
-        env = ROOT / ".venv"
-        python = env / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-        if not python.is_file():
-            print("Создаю локальное окружение .venv…")
-            subprocess.run([sys.executable, "-m", "venv", str(env)], check=True)
-        os.execv(str(python), [str(python), str(ROOT / "main.py"), *sys.argv[1:]])
-        return False
-    try:
-        pip = subprocess.run(
-            [sys.executable, "-m", "pip", "--version"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        if pip.returncode:
-            subprocess.run(
-                [sys.executable, "-m", "ensurepip", "--upgrade"],
-                check=True,
-                timeout=120,
-            )
-        command = [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--disable-pip-version-check",
-            "--no-input",
-            "-r",
-            str(ROOT / "requirements.txt"),
-        ]
-        if any(row["kind"] == "import" for row in issues):
-            command.append("--force-reinstall")
-        print("Устанавливаю зависимости из requirements.txt…")
-        subprocess.run(command, check=True, timeout=600)
-        subprocess.run([sys.executable, "-m", "pip", "check"], check=True, timeout=60)
-    except (OSError, subprocess.SubprocessError) as error:
-        raise StartupError(
-            "Установка зависимостей не завершена. Проверьте сеть, Python и вывод pip. Настроенные конфиги не изменялись."
-        ) from error
-    os.environ[flag] = "1"
-    os.execv(sys.executable, [sys.executable, str(ROOT / "main.py"), *sys.argv[1:]])
-    return False
-
-
 def repair_config_file(path):
-    """A malformed JSON file is never replaced with defaults or an empty object."""
+    """Предлагает исправить повреждённый JSON, сохраняя исходный файл без перезаписи."""
     path = Path(path)
     while True:
         try:
@@ -329,7 +202,7 @@ def read_core_configuration(path):
 
 
 def configuration_issues(cfg):
-    """Return editable field locations, never secret values or payment state."""
+    """Возвращает расположение полей с ошибками, не раскрывая секреты и состояние платежей."""
     issues = []
 
     def add(section, key, reason, secret=False):
@@ -404,7 +277,6 @@ def configuration_issues(cfg):
         ("AUTOTICKET", "hour"): (0, 23),
         ("WeeklyReport", "weekday"): (0, 6),
         ("WeeklyReport", "hour"): (0, 23),
-        ("Debug", "refresh_seconds"): (1, None),
     }
     for (section, key), (minimum, maximum) in numeric.items():
         try:
@@ -539,7 +411,7 @@ def provider_configuration_issues(module, parser):
 
 
 def installer(cfg, issues=None):
-    """Repair only invalid fields; valid configured credentials are never prompted/reset."""
+    """Запрашивает только неверные поля, сохраняя корректно настроенные доступы."""
     print("Настройка конфигурации. Заполненные корректные поля сохраняются.")
     while True:
         current = configuration_issues(cfg) if issues is None else issues
@@ -598,12 +470,12 @@ def verify_api():
 
 
 def install_api():
-    """The release ships its exact reviewed API; no mutable network bootstrap."""
+    """Использует закреплённую копию API из релиза без загрузки изменяемой версии из сети."""
     verify_api()
 
 
 def configure_plugin(cfg, name):
-    """Set up provider fields without creating application/payment state."""
+    """Настраивает реквизиты поставщика без создания платёжных операций."""
     module, parser, path = read_plugin_setup(cfg, name, repair=True)
     while True:
         try:

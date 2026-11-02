@@ -1,4 +1,4 @@
-"""Public plugin API for FunPay BOT (API_VERSION = 1)."""
+"""Публичный интерфейс плагинов FunPay BOT; версия контракта API_VERSION = 1."""
 
 from decimal import Decimal
 

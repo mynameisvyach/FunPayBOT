@@ -1,4 +1,4 @@
-"""Reports application handlers."""
+"""Курсы, отчёты и статистические графики."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import io
 import secrets
 import time
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from zoneinfo import ZoneInfo
 
 from .. import ui
@@ -22,41 +22,62 @@ from ..ui import ui_collect_statistics, ui_date
 class ReportsMixin:
     async def publish_rates_card(self, text):
         async with self.rates_lock:
-            await self.card("main", "rates", text, new_message=not self.rates_created)
+            previous = {
+                self.state.d["cards"].get("main/rates"),
+                self.state.d.get("rates_pinned"),
+            }
+            await self.card(
+                "main",
+                "rates",
+                text,
+                [[("Обновить", "rates:refresh")]],
+                new_message=True,
+            )
             self.rates_created = True
             message = self.state.d["cards"]["main/rates"]
-            if self.state.d.get("rates_pinned") != message:
-                previous = self.state.d.get("rates_pinned")
+            try:
+                await self.tg.call(
+                    "pin_chat_message",
+                    chat_id=self.group,
+                    message_id=message,
+                    disable_notification=True,
+                )
+            except Exception:
+                LOG.exception(
+                    "Не удалось закрепить новое сообщение с курсами; предыдущий закреп сохранён"
+                )
+                return
+            self.state.d["rates_pinned"] = message
+            self.state.save()
+            for old in previous - {None, message}:
                 try:
                     await self.tg.call(
-                        "pin_chat_message",
-                        chat_id=self.group,
-                        message_id=message,
-                        disable_notification=True,
+                        "unpin_chat_message", chat_id=self.group, message_id=old
                     )
-                    self.state.d["rates_pinned"] = message
-                    self.state.save()
-                    if previous:
-                        try:
-                            await self.tg.call(
-                                "unpin_chat_message",
-                                chat_id=self.group,
-                                message_id=previous,
-                            )
-                        except Exception:
-                            LOG.warning("Previous rates pin could not be removed")
-                except Exception:
-                    LOG.warning("Rates pin failed; check can_pin_messages permission")
-                    if not getattr(self, "pin_warning", False):
-                        self.pin_warning = True
-                        await self.say(
-                            "main",
-                            "Не удалось закрепить курсы. Дайте боту право закреплять сообщения.",
+                except Exception as error:
+                    if not any(
+                        value in str(error).lower()
+                        for value in (
+                            "not pinned",
+                            "message to unpin not found",
+                            "message_id_invalid",
                         )
+                    ):
+                        LOG.warning("Не удалось снять предыдущий закреп курсов")
+                try:
+                    await self.tg.call(
+                        "delete_message", chat_id=self.group, message_id=old
+                    )
+                except Exception as error:
+                    if "message to delete not found" not in str(error).lower():
+                        LOG.warning("Не удалось удалить предыдущее сообщение с курсами")
+                self.state.d.get("ui_messages", {}).pop(str(old), None)
+            self.state.save()
+            LOG.info("Курсы обновлены")
 
-    async def get_market_rates(self):
+    async def get_market_rates(self, *, force=False):
         cached = self.state.d.get("market_rates")
-        if cached and 0 <= time.time() - cached["at"] < 60:
+        if not force and cached and 0 <= time.time() - cached["at"] < 60:
             return cached
 
         def fetch():
@@ -106,21 +127,37 @@ class ReportsMixin:
             )
         return rate
 
-    async def rates(self):
-        stamp = time.time()
-        if self.fp.mode == "demo":
-            text = "USDT/RUB: —\nTON/USD: —"
-        else:
+    @staticmethod
+    def market_rates_text(data):
+        """Оформляет рыночные курсы до тысячных, не меняя точность расчётных значений."""
+
+        def price(value):
+            """Отображает только конечный положительный курс с тремя знаками после запятой."""
             try:
-                data = await self.get_market_rates()
-                text = f"USDT/RUB: {data['usdt_rub']}\nTON/USD: {data['ton_usd']}"
-            except Exception:
-                LOG.exception("Не удалось обновить курсы")
-                cached = self.state.d.get("market_rates")
-                text = "Курсы временно недоступны."
-                if cached:
-                    stamp = cached["at"]
-                    text += f"\nСохранённые данные устарели.\nUSDT/RUB: {cached['usdt_rub']}\nTON/USD: {cached.get('ton_usd', '—')}"
+                number = Decimal(str(value))
+                if number.is_finite() and number > 0:
+                    return f"{number.quantize(Decimal('0.001'), rounding=ROUND_HALF_UP):.3f}"
+            except (ValueError, ArithmeticError):
+                pass
+            return "—"
+
+        return f"USDT/RUB: {price(data.get('usdt_rub'))}\nTON/USD: {price(data.get('ton_usd'))}\nИсточник: CoinGecko"
+
+    async def rates(self, *, force=False):
+        stamp = time.time()
+        try:
+            data = await self.get_market_rates(force=force)
+            text = self.market_rates_text(data)
+            stamp = data["at"]
+        except Exception:
+            LOG.exception("Не удалось обновить курсы")
+            cached = self.state.d.get("market_rates")
+            text = "Курсы временно недоступны."
+            if cached:
+                stamp = cached["at"]
+                text += "\nСохранённые данные устарели.\n" + self.market_rates_text(
+                    cached
+                )
         await self.publish_rates_card(
             "🤑 Актуальные курсы\n"
             + text

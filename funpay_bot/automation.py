@@ -1,4 +1,4 @@
-"""Automation services."""
+"""Службы автоматизации."""
 
 from __future__ import annotations
 
@@ -164,17 +164,17 @@ class ReleaseFeatures:
         text += f"\n\nПодтверждённые поступления: {total['credit']:.2f} ₽\nНе подтверждено: {total['pending']:.2f} ₽\nСебестоимость выданного: {total['cost']:.2f} ₽\nРасчётная комиссия вывода: {total['estimated_fee']:.2f} ₽\nПоправка фактической комиссии: {total['correction']:.2f} ₽\nПрибыль с учтённой себестоимостью: {total['profit']:.2f} ₽\nВыведено по учёту: {total['withdrawn']:.2f} ₽\nРасходы на вывод по учёту: {total['actual_fee']:.2f} ₽\nКомиссия способа (для USDT — расчёт тарифа): {total['actual_service_fee']:.2f} ₽\nИз них разница курсов: {total['actual_fx_loss']:.2f} ₽\nВозвращённые поступления: {total['refunds']:.2f} ₽"
         if self.cfg.get("AutoWithdraw", "method_kind", "card") == "usdt_trc20":
             text += "\n\nUSDT: комиссия способа и курсовая разница учтены раздельно; рублёвая оценка получения фиксируется по рыночному ориентиру в момент расчёта. До расчёта вывода 6% — только базовая оценка, курсовая разница может быть неизвестна."
-        legacy = sum(
+        historical_profit = sum(
             (
                 money(day.get("total_profit", 0))
                 for key, plugin in self.state.d["plugin_state"].items()
                 if source is None or key == source
-                for day in plugin.get("legacy_stats", {}).values()
+                for day in plugin.get("historical_statistics", {}).values()
             ),
             Decimal("0"),
         )
-        if legacy:
-            text += f"\n\nСохранённый итог прежних плагинов: {legacy:.2f} ₽. Это готовая историческая прибыль; комиссия из неё повторно не удерживается. Новые операции показаны выше."
+        if historical_profit:
+            text += f"\n\nИсторический итог: {historical_profit:.2f} ₽. Это готовая историческая прибыль; комиссия из неё повторно не удерживается. Новые операции показаны выше."
         if total["unknown_cost"]:
             text += f"\n⚠ Себестоимость неизвестна у {total['unknown_cost']} заказов: итог прибыли неполный."
         if total["foreign"]:

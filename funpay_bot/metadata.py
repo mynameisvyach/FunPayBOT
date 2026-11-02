@@ -1,4 +1,4 @@
-"""Release identity and project paths."""
+"""Название проекта, закреплённая ревизия API и рабочие пути."""
 
 from __future__ import annotations
 
@@ -8,8 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "v1.25"
-
+from main import VERSION as VERSION
 
 BOT_NAME = "FunPay BOT"
 
@@ -24,6 +23,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 TITLES = {
+    "Fulfillment": "✅ Сообщение о выполнении",
     "AUTOGREETINGS": "👋 Приветствия",
     "AUTORESPONSE": "💬 Автоответы",
     "CONFIRMATIONREPLY": "✅ Ответ после подтверждения",
@@ -38,7 +38,7 @@ TITLES = {
 }
 
 
-LOG = logging.getLogger("unified")
+LOG = logging.getLogger("FunPayBOT")
 
 
 def human_time(cfg, timestamp=None):

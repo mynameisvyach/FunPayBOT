@@ -1,4 +1,4 @@
-"""Management services."""
+"""Управление доступами, прокси и резервными копиями."""
 
 from __future__ import annotations
 
@@ -97,7 +97,7 @@ class BackupArchive:
             "config.json",
             "data/state.json",
         } <= set(files):
-            raise ValueError("Нужен полный архив unified-backup-v2")
+            raise ValueError("Нужен полный архив резервной копии FunPayBOT")
         hashes = manifest.get("sha256", {})
         if set(hashes) != set(files) or any(
             hashlib.sha256(body).hexdigest() != hashes[name]
@@ -109,8 +109,8 @@ class BackupArchive:
     @staticmethod
     def validate_state(current, restored):
         if restored.get("identity") != current.get("identity") or restored.get(
-            "binding"
-        ) != current.get("binding"):
+            "binding", {}
+        ).get("group") != current.get("binding", {}).get("group"):
             raise ValueError("Архив принадлежит другому боту, аккаунту или группе")
         for section in ("actions", "withdrawals"):
             for key, value in current.get(section, {}).items():
@@ -231,24 +231,6 @@ class ManagementFeatures:
         )
 
     async def service_callback(self, data, user, topic, message):
-        if data == "core_debug:export":
-            if topic == "main" and message.get("message_id") == self.state.d[
-                "cards"
-            ].get("main/debug"):
-                await self.tg.call(
-                    "send_document",
-                    chat_id=self.group,
-                    message_thread_id=self.state.d["topics"]["main"],
-                    document=(
-                        "event-debug.json",
-                        json.dumps(
-                            self.state.d.get("debug_events", []),
-                            ensure_ascii=False,
-                            indent=2,
-                        ).encode(),
-                    ),
-                )
-            return True
         if data.startswith("ticketreview:"):
             if topic != "main":
                 return True
@@ -293,7 +275,7 @@ class ManagementFeatures:
             await self.card(
                 "main",
                 "menu",
-                "Пришлите ZIP unified-backup-v2, до 40 МБ. Сначала проверю архив и покажу состав.",
+                "Пришлите ZIP резервной копии FunPayBOT, до 40 МБ. Сначала проверю архив и покажу состав.",
                 [[("Отмена", "service:backup_menu")]],
             )
         elif action == "backup_menu":
@@ -540,7 +522,7 @@ class ManagementFeatures:
             "send_document",
             chat_id=self.group,
             message_thread_id=self.state.d["topics"]["main"],
-            document=("unified-backup.zip", body),
+            document=("FunPayBOT-backup.zip", body),
         )
 
     async def restore_backup(self, user, token):
@@ -606,7 +588,10 @@ class ManagementFeatures:
 
     def system_rows(self):
         rows = []
-        for name in self.available_system_names():
+        for name in sorted(
+            self.available_system_names(),
+            key=lambda item: (item not in self.plugins, item),
+        ):
             component = self.plugins.get(name)
             running = component is not None
             metadata = self.state.d.get("plugin_metadata", {}).get(name, {})
@@ -615,7 +600,7 @@ class ManagementFeatures:
                 "TITLE",
                 metadata.get("title", name),
             )
-            label = ("🟢 " if running else "⚪ ") + title
+            label = title
             topic = self.state.d["topics"].get("plugin:" + name)
             opener = (
                 {
@@ -676,11 +661,9 @@ class ManagementFeatures:
         await self.menu("plugins")
 
     def lot_tools_manager(self):
-        backend = self.plugins.get("lot_tools")
-        if backend is None:
-            return None
-        if self.tools_manager is None or self.tools_manager.ctx.backend is not backend:
-            self.tools_manager = LotToolsManager(self, backend)
+        """Возвращает встроенные инструменты, использующие адаптер FunPay напрямую."""
+        if self.tools_manager is None:
+            self.tools_manager = LotToolsManager(self, self.fp)
         return self.tools_manager
 
     async def management_callback(self, data, user):
@@ -704,9 +687,8 @@ class ManagementFeatures:
                         [("‹ Плагины", "menu:plugins")],
                     ],
                 )
-            elif plugin_capability(component, "lot_tools"):
-                await self.central_lot_menu(name)
             elif hasattr(component, "menu"):
+                self.reopen_plugin_menu(name)
                 await component.menu(new_message=True)
         elif data.startswith("lot_tools_action:"):
             manager = self.lot_tools_manager()
@@ -730,10 +712,7 @@ class ManagementFeatures:
                     rows.append(
                         [(getattr(plugin, "TITLE", name), "lot_source:" + name)]
                     )
-            if "lot_tools" in self.plugins:
-                rows.append(
-                    [("Инструменты переноса и очистки", "lot_source:lot_tools")]
-                )
+            rows.append([("🧰 Инструменты переноса и очистки", "lot_source:lot_tools")])
             await self.card(
                 "main",
                 "menu",
@@ -869,16 +848,7 @@ class ManagementFeatures:
 
     async def central_lot_menu(self, name):
         if name == "lot_tools":
-            manager = self.lot_tools_manager()
-            if manager:
-                await manager.menu()
-            else:
-                await self.card(
-                    "main",
-                    "menu",
-                    "Система инструментов лотов остановлена. Включите её в разделе «Плагины».",
-                    [[("‹ Главное", "menu:main")]],
-                )
+            await self.lot_tools_manager().menu()
             return
         plugin = self.plugins.get(name) or self.dormant_plugins.get(name)
         if not plugin:
@@ -919,16 +889,7 @@ class ManagementFeatures:
             ]
             rows = [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
         else:
-            manager = self.lot_tools_manager()
-            if manager:
-                await manager.menu()
-            else:
-                await self.card(
-                    "main",
-                    "menu",
-                    "Система инструментов лотов остановлена. Включите её в разделе «Плагины».",
-                    [[("‹ Главное", "menu:main")]],
-                )
+            await self.lot_tools_manager().menu()
             return
         await self.card("main", "menu", text, rows + [[("‹ Лоты", "lots_menu")]])
 
@@ -1090,7 +1051,7 @@ class ManagementFeatures:
                 # Failed history/status reads never imply absence of a complaint.
                 import logging
 
-                logging.getLogger("unified").exception(
+                logging.getLogger("FunPayBOT").exception(
                     "Не удалось проверить заказ для тикета: %s", key
                 )
         orders = clear + ambiguous
@@ -1099,9 +1060,9 @@ class ManagementFeatures:
             return
         first = ", ".join("#" + v for v in clear) or "Нет"
         second = ", ".join("#" + v for v in ambiguous) or "Нет"
-        template = self.cfg.get("AUTOTICKET", "message")
+        template = self.render(self.cfg.get("AUTOTICKET", "message"), {})
         if template.count("{}") == 2:
-            text = template.format(first, second)
+            text = template.replace("{}", first, 1).replace("{}", second, 1)
         else:
             text = (
                 template.replace("{clear_orders}", first)
@@ -1152,7 +1113,7 @@ class ManagementFeatures:
                 self.state.save()
                 continue
             if (
-                self.state.d["orders"]
+                self.state.d["ledger"]
                 .get(row["event"].get("order_id"), {})
                 .get("status")
                 == "REFUNDED"
@@ -1178,7 +1139,9 @@ class ManagementFeatures:
                 chat = "chat:" + str(row["event"]["chat"])
                 if chat not in self.state.d["topics"]:
                     await self.topic(chat)
-                await self.send_buyer(row["event"], row["text"], row["action"])
+                await self.send_buyer(
+                    row["event"], row["text"], row["action"], rendered=True
+                )
                 action = self.state.d["actions"].get(row["action"], {})
                 if action.get("status") == "done":
                     row["status"] = "done"
@@ -1192,7 +1155,7 @@ class ManagementFeatures:
 
 
 def apply_pending_restore(root, config_path=None):
-    """Call under SingleProcess, before Config/State/network initialization."""
+    """Применяет восстановление под блокировкой процесса до загрузки настроек, состояния и сети."""
     root = Path(root)
     pending = root / "data" / "restore-pending.zip"
     if not pending.exists():

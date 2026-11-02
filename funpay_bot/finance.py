@@ -1,4 +1,4 @@
-"""Finance services."""
+"""Финансовый учёт, комиссии и статистика."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ def money(value):
 
 
 class WithdrawalCosts:
-    """Reference tariffs from the owner's screenshots; server preview remains authoritative."""
+    """Рассчитывает справочные комиссии; итоговые условия определяет предварительный расчёт площадки."""
 
     @staticmethod
     def terms(kind):
@@ -68,7 +68,7 @@ class WithdrawalCosts:
 
 
 class FinancialLedger:
-    """Cash movements and profit remain separate; all monetary values are decimal strings."""
+    """Раздельно учитывает движение средств и прибыль; суммы хранятся десятичными строками."""
 
     def __init__(self, state):
         self.state = state
@@ -268,7 +268,7 @@ class FinancialLedger:
 
 
 class RMTHubStatistics:
-    """Public review analytics; never a source of private balances or profit."""
+    """Получает публичную аналитику отзывов без использования её для личных балансов и прибыли."""
 
     @staticmethod
     def validate(payload, expected_id):

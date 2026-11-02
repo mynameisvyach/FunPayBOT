@@ -1,13 +1,22 @@
-"""Lot tools services."""
+"""Операции переноса, импорта и очистки лотов."""
 
 from __future__ import annotations
 
 import base64
+import copy
 import io
 import json
+import re
 import secrets
 import time
 from urllib.parse import urlsplit
+
+from .lot_files import (
+    build_series,
+    normalize_lots,
+    parse_quantities,
+    validate_form_values,
+)
 
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 
@@ -87,7 +96,7 @@ def export_images(account, lot_id):
 
 
 class MainLotToolsContext:
-    """UI adapter owned by the host; a lot-tools backend supplies operations only."""
+    """Открывает встроенные инструменты лотов в главном меню ядра."""
 
     def __init__(self, app, backend):
         self.app, self.backend = app, backend
@@ -131,11 +140,13 @@ class LotToolsManager:
         self.inputs = {}
         self.plans = {}
         self.imports = {}
+        self.series = {}
 
     async def stop(self):
         self.inputs.clear()
         self.plans.clear()
         self.imports.clear()
+        self.series.clear()
 
     async def menu(self, *, new_message=False):
         await self.ctx.card(
@@ -145,16 +156,112 @@ class LotToolsManager:
                 [("🧹 Быстрая очистка", "clean")],
                 [("🗑 Удаление по категории", "category")],
                 [("🌐 Экспорт публичных лотов", "public")],
-                [("📦 Перенос своих лотов", "transfer")],
+                [("📦 Выгрузить / загрузить свои лоты", "transfer")],
+                [("🔢 Создать серию по количествам", "series")],
                 [("‹ Лоты", "__back_lots")],
             ],
             new_message=new_message,
         )
 
     async def callback(self, action, user):
-        if action == "menu":
+        if action == "series":
+            self.inputs[user] = ("series_file", time.time() + 900)
+            await self.ctx.card(
+                "Отправьте JSON-шаблон лота или старую выгрузку. После выбора шаблона укажите количества. Поле {quantity} в тексте заменится количеством.",
+                [[("Отмена", "menu")]],
+            )
+        elif action.startswith("series_pick:"):
+            plan = self.series.get(user)
+            if not plan or plan["expires"] < time.time():
+                return
+            index = int(action.split(":")[1])
+            if not 0 <= index < len(plan["templates"]):
+                return
+            plan["template"] = plan["templates"][index]
+            fields = [
+                key
+                for key in plan["template"]["fields"]
+                if key.startswith("fields[")
+                and ("quantity" in key or "amount" in key)
+                and len(re.findall(r"[0-9]+", str(plan["template"]["fields"][key])))
+                == 1
+            ]
+            if not fields:
+                fields = [
+                    key
+                    for key in plan["template"]["fields"]
+                    if key.startswith("fields[")
+                    and re.fullmatch(r"[0-9]+", str(plan["template"]["fields"][key]))
+                ]
+            plan["fields"] = fields
+            await self.ctx.card(
+                "Выберите поле с количеством единиц товара. Не путайте со складским остатком.",
+                [
+                    [
+                        (
+                            key + " = " + str(plan["template"]["fields"][key])[:25],
+                            "series_field:" + str(i),
+                        )
+                    ]
+                    for i, key in enumerate(fields)
+                ]
+                + [[("Отмена", "menu")]],
+            )
+        elif action.startswith("series_field:"):
+            plan = self.series.get(user)
+            if not plan or plan["expires"] < time.time():
+                return
+            index = int(action.split(":")[1])
+            if not 0 <= index < len(plan.get("fields", [])):
+                return
+            plan["field"] = plan["fields"][index]
+            self.inputs[user] = ("series_quantities", time.time() + 900)
+            await self.ctx.card(
+                "Введите количества через пробел, например: 50 75 100 150 200 250. До 100 разных количеств за запуск инструмента.",
+                [[("Отмена", "menu")]],
+            )
+        elif action.startswith("series_price:"):
+            plan = self.series.get(user)
+            if not plan or plan["expires"] < time.time():
+                return
+            lots = build_series(
+                plan["template"],
+                plan["field"],
+                plan["quantities"],
+                scale_price=action.endswith(":scale"),
+                rules=await self.ctx.backend.lot_form_rules(
+                    plan["template"]["category"]
+                ),
+            )
+            await self.prepare_import(user, lots)
+        elif action.startswith("import_mode:"):
+            _, token, mode = action.split(":")
+            plan = self.imports.get(user)
+            if not plan or plan["token"] != token or plan["expires"] < time.time():
+                return
+            plan["active"] = mode == "active"
+            for row in plan["lots"]:
+                row["create_active"] = plan["active"]
+            await self.ctx.file(
+                "lots-create-preview.json",
+                json.dumps(
+                    {"format": "unified-lots-v1", "lots": plan["lots"]},
+                    ensure_ascii=False,
+                    indent=2,
+                ).encode(),
+            )
+            await self.ctx.card(
+                f"Создать лотов: {len(plan['lots'])}. Состояние новых: {'активны' if plan['active'] else 'выключены'}. Точные количества, цены и поля — в файле выше. Существующие лоты не меняются. При первом отказе или неизвестном результате операция остановится.",
+                [
+                    [("Создать перечисленные", "import_confirm_" + token)],
+                    [("Отмена", "menu")],
+                ],
+            )
+        elif action == "menu":
             self.inputs.pop(user, None)
             self.plans.pop(user, None)
+            self.imports.pop(user, None)
+            self.series.pop(user, None)
             await self.menu()
         elif action in ("public", "category"):
             self.inputs[user] = (action, time.time() + 300)
@@ -168,12 +275,26 @@ class LotToolsManager:
             await self.prepare_delete(user, await self.ctx.backend.lots())
         elif action == "transfer":
             await self.ctx.card(
-                "📦 Перенос своих лотов\nВыгрузите редактируемые поля, затем отправьте JSON в главную тему на нужном аккаунте. Импорт создаёт новые выключенные лоты. Изображения переносятся файлами; складские товары включаются только отдельной кнопкой экспорта. Автовыдача в копиях выключена.",
+                "📦 Перенос своих лотов\nВыгрузите редактируемые поля, затем отправьте JSON в главную тему на нужном аккаунте. Перед созданием выбирается активность новых лотов. Изображения переносятся файлами; складские товары включаются только отдельной кнопкой экспорта. Автовыдача в копиях выключена.",
                 [
                     [("Экспорт с изображениями", "export_own")],
+                    [("Загрузить JSON", "upload")],
                     [("Экспорт со складскими товарами", "export_stock")],
+                    [("Экспорт категории, включая выключенные", "export_category")],
                     [("‹ Назад", "menu")],
                 ],
+            )
+        elif action == "export_category":
+            self.inputs[user] = ("export_category", time.time() + 300)
+            await self.ctx.card(
+                "Введите ID категории. Будут выгружены все свои обычные лоты в ней, включая выключенные. Этот способ работает и когда в категории нет активных лотов.",
+                [[("Отмена", "menu")]],
+            )
+        elif action == "upload":
+            self.inputs[user] = ("import_file", time.time() + 900)
+            await self.ctx.card(
+                "Отправьте JSON своих лотов: экспорт FunPay BOT или старый список полей формы.",
+                [[("Отмена", "menu")]],
             )
         elif action in ("export_own", "export_stock"):
             rows = await self.ctx.backend.lot_export(
@@ -201,16 +322,21 @@ class LotToolsManager:
             if not self.ctx.app.cfg.flag("SellerStatus", "online"):
                 await self.ctx.say("Включите онлайн перед импортом.")
                 return
+            if "active" not in plan:
+                await self.ctx.say("Сначала выберите активность новых лотов.")
+                return
+            await self.check_limits(plan["lots"])
             count = 0
             for i, row in enumerate(plan["lots"]):
                 ok = await self.ctx.app.once(
                     "lot_import:" + plan["token"] + ":" + str(i),
                     lambda row=row: self.ctx.backend.lot_import_one(row),
                 )
-                if ok:
-                    count += 1
+                if not ok:
+                    break
+                count += 1
             await self.ctx.say(
-                f"Создано выключенных лотов: {count} из {len(plan['lots'])}. Перед включением проверьте поля и изображения на FunPay."
+                f"Создано лотов: {count} из {len(plan['lots'])}. Состояние новых: {'активны' if plan['active'] else 'выключены'}. Если операция остановилась, проверьте результат на FunPay перед повторной загрузкой."
             )
             await self.menu()
         elif action.startswith("confirm_"):
@@ -234,9 +360,7 @@ class LotToolsManager:
                 if not ok:
                     break
                 done += 1
-            await self.ctx.say(
-                f"Удаление: подтверждено {done} из {len(plan['ids'])}. Режим: {self.ctx.backend.mode}."
-            )
+            await self.ctx.say(f"Удаление: подтверждено {done} из {len(plan['ids'])}.")
             await self.menu()
 
     async def message(self, text, user):
@@ -244,10 +368,33 @@ class LotToolsManager:
         if not pending:
             return
         action, expires = pending
+        if action == "series_quantities" and expires >= time.time():
+            plan = self.series.get(user)
+            if not plan or plan["expires"] < time.time():
+                return
+            try:
+                plan["quantities"] = parse_quantities(text)
+            except ValueError as error:
+                self.inputs[user] = pending
+                await self.ctx.say(str(error))
+                return
+            await self.ctx.card(
+                "Как считать цену? Пропорционально: цена шаблона × новое количество / количество шаблона. Либо одна цена для каждого лота. Итоговые цены будут показаны до создания.",
+                [
+                    [("Пропорционально количеству", "series_price:scale")],
+                    [("Сохранить цену шаблона", "series_price:fixed")],
+                    [("Отмена", "menu")],
+                ],
+            )
+            return
         if expires < time.time() or not text.strip().isdigit():
             await self.ctx.say("Нужен числовой ID; откройте действие снова.")
             return
         category = int(text.strip())
+        if action == "export_category":
+            lots = await self.ctx.backend.lot_export(category=category)
+            await self.export(lots, "own-lots-category.json")
+            return
         if action == "public":
             await self.export(
                 await self.ctx.backend.public_seller_export(category),
@@ -263,10 +410,9 @@ class LotToolsManager:
 
     async def document(self, name, body, user):
         try:
-            data = json.loads(body)
-            if data.get("format") != "unified-lots-v1":
+            if len(body) > 45 * 1024 * 1024:
                 raise ValueError()
-            lots = data["lots"]
+            lots = normalize_lots(json.loads(body))
             if not isinstance(lots, list) or not 1 <= len(lots) <= 1000:
                 raise ValueError()
             total_images = 0
@@ -294,20 +440,67 @@ class LotToolsManager:
                     for k, v in row["fields"].items()
                 ):
                     raise ValueError()
-        except (ValueError, KeyError, TypeError, OSError):
+        except (ValueError, KeyError, TypeError, OSError, ArithmeticError):
             await self.ctx.say(
                 "Не удалось прочитать файл переноса unified-lots-v1. Лимит — 1000 лотов и 30 МБ изображений."
             )
             return
+        pending = self.inputs.get(user)
+        if pending and pending[0] == "series_file" and pending[1] >= time.time():
+            self.inputs.pop(user, None)
+            self.series[user] = {"templates": lots, "expires": time.time() + 900}
+            await self.ctx.card(
+                "Выберите образец для серии. Будут созданы только указанные вами количества.",
+                [
+                    [
+                        (
+                            "Образец "
+                            + str(i + 1)
+                            + ": "
+                            + str(
+                                row["fields"].get(
+                                    "fields[summary][ru]",
+                                    row["fields"].get("fields[quantity2]", "лот"),
+                                )
+                            )[:35],
+                            "series_pick:" + str(i),
+                        )
+                    ]
+                    for i, row in enumerate(lots[:100])
+                ]
+                + [[("Отмена", "menu")]],
+            )
+            return
+        self.inputs.pop(user, None)
+        await self.prepare_import(user, lots)
+
+    async def check_limits(self, lots):
+        """Проверяет свежие ограничения формы каждой задействованной категории."""
+        rules = {}
+        for row in lots:
+            category = int(row["category"])
+            if category not in rules:
+                rules[category] = await self.ctx.backend.lot_form_rules(category)
+            validate_form_values(row, rules[category])
+
+    async def prepare_import(self, user, lots):
+        """Создаёт план и требует явно выбрать активность новых лотов."""
+        await self.check_limits(lots)
         token = secrets.token_hex(6)
         self.imports[user] = {
             "token": token,
-            "expires": time.time() + 300,
-            "lots": lots,
+            "expires": time.time() + 900,
+            "lots": copy.deepcopy(lots),
         }
         await self.ctx.card(
-            f"Создать {len(lots)} выключенных лотов на текущем аккаунте? Складских записей: {sum(len(row.get('warehouse_secrets', [])) for row in lots)}.\nИсходные лоты не изменяются. Подтверждение действует 5 минут.",
-            [[("Создать копии", "import_confirm_" + token)], [("Отмена", "menu")]],
+            f"Подготовлено новых лотов: {len(lots)}. Оставить их активными или создать сразу выключенными? Это относится только к создаваемым лотам. Изображения по старым ID не переносятся; нужны вложения из экспорта бота.",
+            [
+                [
+                    ("Оставить активными", "import_mode:" + token + ":active"),
+                    ("Сразу выключить", "import_mode:" + token + ":inactive"),
+                ],
+                [("Отмена", "menu")],
+            ],
         )
 
     async def export(self, lots, name):
@@ -316,9 +509,8 @@ class LotToolsManager:
             json.dumps(
                 {
                     "format": "unified-lots-v1"
-                    if name == "public-lots.json"
+                    if name in ("public-lots.json", "own-lots-category.json")
                     else "lot-list-v1",
-                    "mode": self.ctx.backend.mode,
                     "full_backup": False,
                     "lots": lots,
                 },
@@ -340,7 +532,7 @@ class LotToolsManager:
         }
         await self.export(lots, "delete-plan.json")
         await self.ctx.card(
-            f"🗑 Удалить {len(lots)} лотов?\nТочный список отправлен выше. Действие необратимо.\nПодтверждение действует 5 минут и только для автора запроса.\nРежим: {self.ctx.backend.mode}",
+            f"🗑 Удалить {len(lots)} лотов?\nТочный список отправлен выше. Действие необратимо.\nПодтверждение действует 5 минут и только для автора запроса.",
             [
                 [("Удалить перечисленные лоты", "confirm_" + token)],
                 [("Отмена", "menu")],

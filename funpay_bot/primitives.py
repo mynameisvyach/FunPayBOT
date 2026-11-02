@@ -1,4 +1,4 @@
-"""Primitives services."""
+"""Общие механизмы очередей, таймеров и безопасного изменения состояния."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 
 class CaseDict(dict):
-    """Case-insensitive access to the current lowercase JSON schema."""
+    """Предоставляет доступ к ключам текущей JSON-схемы без учёта регистра."""
 
     def _key(self, key):
         if key in self:
@@ -93,7 +93,7 @@ class TimerRegistry:
 
 
 class SerialTaskQueue:
-    """One worker per plugin; concurrent callers receive their own result."""
+    """Последовательно выполняет задачи плагина и возвращает результат каждому вызывающему."""
 
     def __init__(self):
         self.lock = asyncio.Lock()
@@ -130,7 +130,7 @@ class RetryPolicy:
 
 @contextlib.contextmanager
 def state_transaction(state):
-    """Synchronous state mutation only: no await inside this transaction."""
+    """Изменяет состояние синхронно; внутри транзакции запрещены сетевые ожидания await."""
     before = copy.deepcopy(state.d)
     try:
         yield state.d
@@ -154,7 +154,7 @@ def restore_mapping(target, snapshot):
 
 
 class UniversalDumper:
-    """Currency-independent competitive price selection with an explicit floor."""
+    """Выбирает конкурентную цену с явным защитным минимумом независимо от валюты."""
 
     @staticmethod
     def choose(

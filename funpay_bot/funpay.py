@@ -1,4 +1,4 @@
-"""Funpay services."""
+"""Запросы к FunPay, получение событий и операции аккаунта."""
 
 from __future__ import annotations
 
@@ -6,15 +6,19 @@ import asyncio
 import html
 import io
 import json
+import logging
 import re
 import sys
 import time
 from decimal import Decimal
-from pathlib import Path
 
 from .finance import money
+from .lot_files import save_lot_once
 from .lot_tools import export_images, validate_images
-from .metadata import LOG, ROOT
+from .metadata import ROOT
+from .templates import order_template_values
+
+LOG = logging.getLogger("FunPayBOT.funpay")
 
 
 class SupportTickets:
@@ -401,6 +405,7 @@ class FunPayOperations:
             raise ValueError("Заказ принадлежит другому продавцу")
         # Use order shortcut for seller credit rather than buyer gross price.
         return {
+            **order_template_values(o),
             "status": o.status.name,
             "currency": o.currency.name,
             "chat": self.resolve_chat(o.chat_id, o.buyer_username),
@@ -409,38 +414,56 @@ class FunPayOperations:
     async def refund_order(self, order):
         await self.invoke(self.account.refund, order)
 
-    async def lot_export(self, include_secrets=False):
-        def read():
-            result = []
-            self.lot_export_errors = []
-            for lot in self.account.get_user(self.account.id).get_lots():
-                if lot.subcategory.type.name != "COMMON":
-                    continue
-                try:
+    async def lot_export(self, include_secrets=False, category=None):
+        """Выгружает свои редактируемые лоты, включая выключенные в выбранных категориях."""
+
+        def categories():
+            """Выбирает категории аккаунта или заданную владельцем категорию."""
+            if category is not None:
+                return [int(category)]
+            return sorted(
+                {
+                    lot.subcategory.id
+                    for lot in self.account.get_user(self.account.id).get_lots()
+                    if lot.subcategory.type.name == "COMMON"
+                }
+            )
+
+        result = []
+        self.lot_export_errors = []
+        for category_id in await self.invoke(categories):
+            lots = await self.invoke(
+                self.account.get_my_subcategory_lots, category_id, _lot_request=True
+            )
+            for lot in lots:
+
+                def read(lot=lot):
+                    """Читает переносимые поля и изображения одного собственного лота."""
                     fields = self.account.get_lot_fields(int(lot.id))
                     clean = {
-                        k: v
-                        for k, v in fields.renew_fields().fields.items()
-                        if k not in ("csrf_token", "offer", "secrets")
+                        key: value
+                        for key, value in fields.renew_fields().fields.items()
+                        if key.startswith("fields[")
+                        or key in ("price", "amount", "deactivate_after_sale")
                     }
-                    clean["active"] = ""
-                    clean["auto_delivery"] = ""
                     clean["fields[images]"] = ""
                     row = {
                         "id": lot.id,
-                        "category": lot.subcategory.id,
+                        "category": category_id,
                         "fields": clean,
+                        "was_active": bool(fields.active),
                         "images": export_images(self.account, lot.id),
                     }
                     if include_secrets:
                         row["warehouse_secrets"] = list(fields.secrets)
-                    result.append(row)
+                    return row
+
+                try:
+                    result.append(await self.invoke(read, _lot_request=True))
                 except Exception:
                     self.lot_export_errors.append(str(lot.id))
                     LOG.exception("Экспорт лота %s не завершён", lot.id)
-            return result
-
-        return await self.invoke(read)
+        return result
 
     async def lot_import_one(self, row):
         def create():
@@ -477,16 +500,55 @@ class FunPayOperations:
                 template.currency,
                 template.calc_result,
             )
-            new.active = False
+            new.active = bool(row.get("create_active", False))
             new.auto_delivery = False
             new.secrets = secrets_
             new.images = [
                 self.account.upload_image(io.BytesIO(body), type_="offer")
                 for body in images
             ]
-            self.account.save_lot(new)
+            save_lot_once(self.account, new)
 
-        await self.invoke(create)
+        await self.invoke(create, _lot_request=True)
+
+    async def lot_form_rules(self, category):
+        """Получает min/max/step и варианты значений непосредственно из формы категории."""
+
+        def read():
+            """Разбирает ограничения элементов формы без отправки сохранения."""
+            from bs4 import BeautifulSoup
+
+            response = self.account.method(
+                "get",
+                "lots/offerEdit?node=" + str(int(category)),
+                {},
+                {},
+                raise_not_200=True,
+            )
+            soup = BeautifulSoup(response.text, "lxml")
+            form = soup.select_one("form.form-offer-editor")
+            if form is None:
+                raise ValueError(
+                    "FunPay не разрешил открытие формы создания в этой категории"
+                )
+            result = {}
+            for node in form.select("input[name],select[name],textarea[name]"):
+                rule = {
+                    key: str(node[key])
+                    for key in ("type", "min", "max", "step", "maxlength")
+                    if node.has_attr(key)
+                }
+                rule["required"] = node.has_attr("required")
+                if node.name == "select":
+                    rule["options"] = [
+                        str(option.get("value", ""))
+                        for option in node.select("option")
+                        if not option.has_attr("disabled")
+                    ]
+                result[node["name"]] = rule
+            return result
+
+        return await self.invoke(read, _lot_request=True)
 
     async def lot_update(
         self,
@@ -498,10 +560,10 @@ class FunPayOperations:
         deactivate_after_sale=None,
     ):
         def save():
-            owned = self.account.get_user(self.account.id).get_lot(lot_id)
-            if not owned:
-                raise ValueError("Нет собственного лота с этим ID")
             f = self.account.get_lot_fields(lot_id)
+            owned = self.account.get_my_subcategory_lots(f.subcategory.id)
+            if not any(str(row.id) == str(lot_id) for row in owned):
+                raise ValueError("Нет собственного лота с этим ID")
             if price is not None:
                 f.price = float(money(price))
             if active is not None:
@@ -510,7 +572,7 @@ class FunPayOperations:
                 f.amount = int(amount)
             if deactivate_after_sale is not None:
                 f.deactivate_after_sale = bool(deactivate_after_sale)
-            self.account.save_lot(f)
+            save_lot_once(self.account, f)
 
         await self.invoke(save, _lot_request=True)
 
@@ -530,117 +592,13 @@ class FunPayOperations:
                 "title": fields.title_ru,
                 "category": fields.subcategory.id,
                 "category_rate": str(Decimal("1") / coefficient),
+                "currency": getattr(fields.currency, "name", str(fields.currency)),
             }
 
         return await self.invoke(read, _lot_request=True)
 
 
-class DemoFunPay:
-    mode = "demo"
-
-    def __init__(self):
-        self.sent = []
-
-    async def start(self):
-        pass
-
-    async def poll(self):
-        return []
-
-    async def send(self, chat, text):
-        self.sent.append(("message", chat, text))
-
-    async def image(self, chat, content):
-        self.sent.append(("image", chat, len(content)))
-
-    async def review(self, order, text):
-        self.sent.append(("review", order, text))
-
-    async def categories(self):
-        return [100, 200]
-
-    async def raise_lots(self, category):
-        self.sent.append(("raise", category))
-        return 3600
-
-    async def order_status(self, order):
-        return None
-
-    async def lots(self, public_category=None):
-        return [
-            {
-                "id": 501,
-                "category": 100,
-                "description": "Демо-лот",
-                "price": "100",
-                "currency": "RUB",
-            }
-        ]
-
-    async def delete_lot(self, lot_id):
-        self.sent.append(("delete_lot", lot_id))
-
-    async def old_paid_orders(self):
-        return []
-
-    async def send_ticket(self, orders, message):
-        return "demo-ticket"
-
-    async def balance(self, cfg):
-        return {"total": "1000.00", "available": "1000.00"}
-
-    async def withdraw_methods(self):
-        return [("card_rub", "Демо-карта", "0000000000000000")]
-
-    async def withdraw_quote(self, cfg, debit):
-        return {"amount_ext": str(money(money(debit) * Decimal(".97")))}
-
-    async def withdraw_submit(self, cfg, receive):
-        return {
-            "amount_int": str(money(money(receive) / Decimal(".97"))),
-            "amount_ext": str(receive),
-        }
-
-    async def profile(self):
-        return "👤 DemoSeller · демонстрационные данные"
-
-    async def rating(self):
-        return "⚖ Демонстрация: ограничения не запрашивались"
-
-    async def verify_order(self, order):
-        return {"status": "PAID", "currency": "RUB", "chat": "101"}
-
-    async def refund_order(self, order):
-        self.sent.append(("refund", order))
-
-    async def lot_export(self):
-        return [
-            {
-                "id": 501,
-                "category": 100,
-                "fields": {"price": "100", "fields[summary][ru]": "Демо-лот"},
-            }
-        ]
-
-    async def lot_import_one(self, row):
-        self.sent.append(("import", row["category"]))
-
-    async def lot_update(self, lot_id, **kw):
-        self.sent.append(("lot_update", lot_id, kw))
-
-    async def lot_floor(self, lot_id):
-        return {
-            "price": "100",
-            "active": True,
-            "title": "50 единиц",
-            "category": 2418,
-            "category_rate": "0.9",
-        }
-
-
 class FunPayClient(FunPayOperations):
-    mode = "live"
-
     def __init__(self, cfg):
         self.cfg = cfg
         self.lock = asyncio.Lock()
@@ -669,17 +627,38 @@ class FunPayClient(FunPayOperations):
                 )
                 return result
             except Exception as e:
-                import traceback
+                from .logging_setup import expected_limit
 
-                frames = [
-                    f"{Path(f.filename).name}:{f.lineno}:{f.name}"
-                    for f in traceback.extract_tb(e.__traceback__)
-                ]
-                LOG.exception(
-                    "Ошибка FunPay: операция=%s, время=%.0f мс",
-                    func.__name__,
-                    (time.monotonic() - start) * 1000,
-                )
+                operation = func.__qualname__.split(".<locals>.")[0].rsplit(".", 1)[-1]
+                labels = {
+                    "categories": "получения категорий для подъёма лотов",
+                    "read_events": "получения событий FunPay",
+                    "raise_lots": "подъёма лотов",
+                    "send_message": "отправки сообщения FunPay",
+                    "send_image": "отправки изображения FunPay",
+                    "get_order": "получения заказа FunPay",
+                    "get_user": "получения профиля FunPay",
+                    "get": "авторизации FunPay",
+                    "save_lot": "сохранения лота",
+                    "save_lot_once": "сохранения лота",
+                    "refund": "возврата оплаты заказа",
+                    "withdraw": "вывода средств",
+                    "send_feedback": "отправки ответа на отзыв",
+                }
+                label = labels.get(operation, "запроса к FunPay")
+                if not getattr(e, "_funpaybot_operation", None):
+                    e._funpaybot_operation = label
+                limit = expected_limit(e)
+                extra = {"error_operation": label, "error_exception": e}
+                if limit:
+                    LOG.warning("%s", limit, extra=extra)
+                else:
+                    LOG.exception(
+                        "Ошибка FunPay: операция=%s, время=%.0f мс",
+                        operation,
+                        (time.monotonic() - start) * 1000,
+                        extra=extra,
+                    )
                 raise
 
     async def start(self):
@@ -703,15 +682,18 @@ class FunPayClient(FunPayOperations):
         self.account.session.mount("https://", HTTPAdapter(max_retries=0))
         await self.invoke(self.account.get)
         self.runner = self.make_runner()
-        LOG.info(
-            "FunPay авторизован: account_id=%s. Получаю начальный снимок до создания Telegram-меню",
-            self.account.id,
-        )
+        from .logging_setup import log_account_summary
+
+        try:
+            balance = await self.balance(self.cfg)
+        except Exception:
+            balance = None
+            LOG.warning(
+                "Не удалось получить баланс для стартового блока; запуск продолжается"
+            )
+        log_account_summary(self.account, balance)
         self.initial_events = await self.poll()
-        LOG.info(
-            "Начальная синхронизация FunPay завершена: чатов=%s. Старые сообщения в Telegram не отправляются",
-            sum(e["kind"] == "baseline" for e in self.initial_events),
-        )
+        LOG.info("Начальная синхронизация FunPay завершена")
 
     def make_runner(self):
         from FunPayAPI.updater.runner import Runner
@@ -747,6 +729,8 @@ class FunPayClient(FunPayOperations):
                     "id": f"m:{m.chat_id}:{m.id}",
                     "chat": str(m.chat_id),
                     "username": m.chat_name or str(m.chat_id),
+                    "chat_name": m.chat_name or str(m.chat_id),
+                    "message_text": str(m),
                     "buyer_id": m.interlocutor_id,
                     "text": m.text or "",
                     "photo": m.image_link,
@@ -778,6 +762,7 @@ class FunPayClient(FunPayOperations):
                     if order.seller_id == self.account.id:
                         result.append(
                             {
+                                **order_template_values(order),
                                 "kind": "review",
                                 "id": f"r:{m.chat_id}:{m.id}",
                                 "chat": str(m.chat_id),
@@ -785,6 +770,9 @@ class FunPayClient(FunPayOperations):
                                 "order_id": order.id,
                                 "buyer_id": order.buyer_id,
                                 "rating": order.review.stars if order.review else 6,
+                                "review_text": order.review.text
+                                if order.review
+                                else "",
                                 "changed": mt == "FEEDBACK_CHANGED",
                             }
                         )
@@ -793,12 +781,13 @@ class FunPayClient(FunPayOperations):
             # Runner also observes purchases. Never automate those as sales.
             if o.buyer_id == self.account.id:
                 return result
-            details = self.account.get_order(o.id) if o.status.name == "PAID" else None
+            details = self.account.get_order(o.id)
             event_id = f"o:{o.id}:{o.status.name}"
             if name == "OrderStatusChangedEvent":
                 event_id += ":" + str(time.time_ns())
             result.append(
                 {
+                    **order_template_values(details, o),
                     "kind": "order",
                     "id": event_id,
                     "chat": self.resolve_chat(o.chat_id, o.buyer_username),
@@ -919,7 +908,7 @@ class FunPayClient(FunPayOperations):
         }
         if result or time.monotonic() - self.poll_heartbeat >= 60:
             self.poll_heartbeat = time.monotonic()
-            LOG.info(
+            LOG.debug(
                 "Опрос FunPay работает: объектов=%s, событий=%s, сообщений=%s, начальных чатов=%s, ожидают историю=%s",
                 len(objects),
                 len(events),

@@ -1,29 +1,15 @@
-"""Telegram services."""
+"""Общий транспорт Telegram."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import copy
 import re
 import time
 
 
-class DemoTelegram:
-    def __init__(self):
-        self.calls = []
-        self.counter = 100
-
-    async def call(self, method, **kw):
-        self.calls.append((method, copy.deepcopy(kw)))
-        self.counter += 1
-        if method == "create_forum_topic":
-            return {"message_thread_id": self.counter}
-        return {"message_id": self.counter}
-
-
 class Telegram:
-    """Shared outbound gate: topics, cards, plugin and chat sends use this queue."""
+    """Управляет общей очередью исходящих запросов для тем, карточек, плагинов и чатов."""
 
     def __init__(self, cfg):
         from aiogram import Bot
@@ -40,8 +26,24 @@ class Telegram:
         from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
         from aiogram.types import BufferedInputFile, InlineKeyboardMarkup
 
+        callback_tokens = []
         if kw.get("reply_markup"):
-            kw["reply_markup"] = InlineKeyboardMarkup.model_validate(kw["reply_markup"])
+            raw = kw["reply_markup"]
+            raw = raw.model_dump() if hasattr(raw, "model_dump") else raw
+            raw = {
+                **raw,
+                "inline_keyboard": [
+                    [dict(cell) for cell in row] for row in raw["inline_keyboard"]
+                ],
+            }
+            encoder = getattr(self, "callback_encoder", None)
+            if encoder:
+                for row in raw["inline_keyboard"]:
+                    for cell in row:
+                        if cell.get("callback_data"):
+                            cell["callback_data"] = encoder(cell["callback_data"])
+                            callback_tokens.append(cell["callback_data"])
+            kw["reply_markup"] = InlineKeyboardMarkup.model_validate(raw)
         if isinstance(kw.get("photo"), tuple):
             name, body = kw["photo"]
             kw["photo"] = BufferedInputFile(body, filename=name)
@@ -68,7 +70,19 @@ class Telegram:
                     value = await getattr(self.bot, method)(**kw)
                     if paced:
                         self.next_send = time.monotonic() + 3.1
-                    return value.model_dump() if hasattr(value, "model_dump") else value
+                    value = (
+                        value.model_dump() if hasattr(value, "model_dump") else value
+                    )
+                    recorder = getattr(self, "callback_recorder", None)
+                    if recorder and callback_tokens:
+                        mid = (
+                            value.get("message_id")
+                            if isinstance(value, dict)
+                            else kw.get("message_id")
+                        )
+                        if mid:
+                            recorder(mid, callback_tokens)
+                    return value
                 except TelegramRetryAfter as e:
                     if attempt == 2:
                         raise
@@ -111,5 +125,8 @@ class Telegram:
                         method == "edit_message_text"
                         and "message is not modified" in str(e).lower()
                     ):
+                        recorder = getattr(self, "callback_recorder", None)
+                        if recorder and callback_tokens:
+                            recorder(kw["message_id"], callback_tokens)
                         return {"message_id": kw["message_id"]}
                     raise

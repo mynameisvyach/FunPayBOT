@@ -1,4 +1,4 @@
-"""Chats application handlers."""
+"""Переписка FunPay, заготовки и автоматические ответы."""
 
 from __future__ import annotations
 
@@ -9,16 +9,23 @@ import json
 import logging
 import re
 import time
-from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from ..finance import FinancialLedger
-from ..logging_setup import Redactor
+from ..logging_setup import Redactor, action_logger
 from ..metadata import LOG, human_time
-from ..telegram import DemoTelegram
+from ..templates import render_template
 
 
 class ChatsMixin:
+    def greeting_provider(self):
+        """Находит работающий плагин, взявший общение и приветствия на себя."""
+        for plugin in self.plugins.values():
+            runtime = getattr(plugin, "runtime", None)
+            service = getattr(runtime, "capabilities", {}).get("greetings")
+            if runtime and runtime.started and service and service.handles_greetings():
+                return service
+        return None
+
     async def once(self, key, operation, *, notify=True):
         if key in self.state.d["actions"]:
             return False
@@ -35,6 +42,10 @@ class ChatsMixin:
                     "action": key,
                     "mirrored": key.startswith("tg:"),
                 }
+                if key.startswith(("tg:", "template:", "owner:")):
+                    self.state.d.setdefault("chat_meta", {}).setdefault(str(chat), {})[
+                        "manual_action"
+                    ] = key
                 while len(outgoing) > 5000:
                     outgoing.pop(next(iter(outgoing)))
         except Exception as e:
@@ -44,8 +55,8 @@ class ChatsMixin:
             )
             self.state.save()
             self.counts["errors"] += 1
-            LOG.error(
-                "Action %s: %s; exception=%s",
+            action_logger(key).error(
+                "Действие %s: %s · ошибка %s",
                 key,
                 "отклонено" if not notify and rejected else "результат неизвестен",
                 type(e).__name__,
@@ -58,6 +69,8 @@ class ChatsMixin:
             return False
         self.state.d["actions"][key]["status"] = "done"
         self.state.save()
+        if key.startswith("tg:"):
+            LOG.info("Сообщение отправлено покупателю из Telegram")
         return True
 
     def send_error(self, error):
@@ -83,8 +96,8 @@ class ChatsMixin:
             reason = "FunPay вернул HTTP " + str(status)
         else:
             reason = "ошибка " + name + "; подробности в журнале"
-        record = logging.LogRecord("unified", logging.INFO, "", 0, reason, (), None)
-        reason = Redactor(self.cfg).format(record).partition("unified: ")[2]
+        record = logging.LogRecord("FunPayBOT", logging.INFO, "", 0, reason, (), None)
+        reason = Redactor(self.cfg).format(record).partition("FunPayBOT: ")[2]
         return " ".join(reason.split())[:350], bool(rejected)
 
     async def send_receipt(self, topic, message, text):
@@ -92,11 +105,11 @@ class ChatsMixin:
         receipts = self.state.d.setdefault("send_receipts", {})
         old = receipts.get(key)
         if old:
-            await self.tg.call(
+            await self.telegram_call(
                 "edit_message_text", chat_id=self.group, message_id=old, text=text
             )
         else:
-            receipt = await self.tg.call(
+            receipt = await self.telegram_call(
                 "send_message",
                 chat_id=self.group,
                 message_thread_id=self.state.d["topics"][topic],
@@ -127,8 +140,7 @@ class ChatsMixin:
     async def telegram_to_funpay(self, message, topic):
         chat = topic[5:]
         key = f"tg:{self.group}:{message['message_id']}"
-        self.state.d["last_human"] = time.time()
-        self.state.save()
+        self.record_human_activity("Telegram")
         if not self.cfg.flag("SellerStatus", "online"):
             await self.send_receipt(
                 topic, message, "❌ Не отправлено (бот в режиме офлайн)"
@@ -152,12 +164,9 @@ class ChatsMixin:
         if photo or image_document:
             if key not in self.state.d["actions"]:
                 try:
-                    if isinstance(self.tg, DemoTelegram):
-                        content = b"demo"
-                    else:
-                        file_id = photo[-1]["file_id"] if photo else doc["file_id"]
-                        data = await self.tg.bot.download(file_id)
-                        content = data.read()
+                    file_id = photo[-1]["file_id"] if photo else doc["file_id"]
+                    data = await self.tg.bot.download(file_id)
+                    content = data.read()
                 except Exception:
                     LOG.exception(
                         "Не удалось скачать изображение Telegram для отправки в FunPay"
@@ -207,7 +216,7 @@ class ChatsMixin:
         for char in str(body):
             escaped = html.escape(char)
             if len(chunk) + len(escaped) > budget:
-                await self.tg.call(
+                await self.telegram_call(
                     "send_message",
                     chat_id=self.group,
                     message_thread_id=self.state.d["topics"][topic],
@@ -218,7 +227,7 @@ class ChatsMixin:
                 )
                 chunk = ""
             chunk += escaped
-        await self.tg.call(
+        await self.telegram_call(
             "send_message",
             chat_id=self.group,
             message_thread_id=self.state.d["topics"][topic],
@@ -227,23 +236,28 @@ class ChatsMixin:
             disable_notification=not notify,
             link_preview_options={"is_disabled": True},
         )
+        if (
+            topic.startswith("chat:")
+            and topic + "/controls" not in self.state.d["cards"]
+        ):
+            await self.refresh_chat_controls(topic[5:])
 
     def render(self, template, event):
-        now = datetime.now(
-            ZoneInfo(self.cfg.get("General", "timezone", "Europe/Moscow"))
-        )
-        values = {
-            "username": event.get("username", "покупатель"),
-            "order_id": event.get("order_id", ""),
-            "date": now.strftime("%d.%m.%Y"),
-            "time": now.strftime("%H:%M"),
-            "command": event.get("text", ""),
-        }
-        for key, value in values.items():
-            template = template.replace("$" + key, str(value)).replace(
-                "{" + key + "}", str(value)
+        """Дополняет контекст сохранёнными данными чата и именно указанного заказа."""
+        meta = self.state.d.get("chat_meta", {}).get(str(event.get("chat", "")), {})
+        order_id = str(event.get("order_id", "") or "").lstrip("#")
+        saved = self.state.d.get("order_cards", {}).get(order_id, {}).get("event", {})
+        if not saved:
+            saved = self.state.d.get("orders", {}).get(order_id, {})
+        values = {**meta, **saved, **event}
+        # В сообщении имя — автор, в заказе — покупатель, независимо от чата.
+        if event.get("kind") == "message":
+            values["template_username"] = event.get("author") or event.get(
+                "username", "покупатель"
             )
-        return template
+        return render_template(
+            template, values, self.cfg.get("General", "timezone", "Europe/Moscow")
+        )
 
     def response_rules(self):
         rules = {}
@@ -257,28 +271,14 @@ class ChatsMixin:
                 rules[str(key).replace("\n", "").strip().casefold()] = rule
         return rules
 
-    @staticmethod
-    def template_label(name):
-        labels = {
-            "thanks": "Спасибо",
-            "wait": "Подождите",
-            "!rules": "Правила покупки",
-            "!property": "Информация об имуществе",
-        }
-        label = labels.get(name.casefold())
-        if label:
-            return label
-        label = name.lstrip("!/").replace("_", " ").strip()
-        return label[:1].upper() + label[1:]
-
     def manual_templates(self):
+        items = self.cfg.data("ChatTemplates", "items", {})
+        if not isinstance(items, dict):
+            return {}
         return {
-            token: {
-                "label": item.get("title", "Заготовка"),
-                "text": item.get("text", ""),
-            }
-            for token, item in self.cfg.data("ChatTemplates", "items", {}).items()
-            if item.get("enabled", True)
+            token: {"label": str(item.get("title") or token), "text": item["text"]}
+            for token, item in items.items()
+            if isinstance(item, dict) and item.get("enabled", True) and item.get("text")
         }
 
     def seller_name(self):
@@ -300,21 +300,22 @@ class ChatsMixin:
             return title.split(" ", 1)[0] if title and not title[0].isalnum() else "🧩"
         return "👤" if action.startswith(("template:", "owner:", "tg:")) else "🤖"
 
-    async def refresh_chat_controls(self, chat):
+    async def refresh_chat_controls(self, chat, *, force=False):
         key = "chat:" + str(chat)
         if key not in self.state.d["topics"]:
             return
         templates = self.manual_templates()
         revision = hashlib.sha256(
             json.dumps(
-                {"templates": templates, "label": self.chat_label(chat)},
+                {"templates": templates, "layout": "seller-templates-v2"},
                 ensure_ascii=False,
                 sort_keys=True,
             ).encode()
         ).hexdigest()
         existing = self.state.d["cards"].get(key + "/controls")
         if (
-            self.state.d.get("controls_revision", {}).get(str(chat)) != revision
+            force
+            or self.state.d.get("controls_revision", {}).get(str(chat)) != revision
             or not existing
         ):
             rows = [
@@ -324,15 +325,14 @@ class ChatsMixin:
             await self.card(
                 key,
                 "controls",
-                self.chat_label(chat)
-                + "\nОтветьте текстом или фото в эту тему — сообщение уйдёт покупателю.\nЗаготовки продавца:",
+                "Заготовки продавца:",
                 rows,
             )
             self.state.d.setdefault("controls_revision", {})[str(chat)] = revision
         current = self.state.d["cards"][key + "/controls"]
         if self.state.d.get("controls_pinned", {}).get(str(chat)) != current:
             try:
-                await self.tg.call(
+                await self.telegram_call(
                     "pin_chat_message",
                     chat_id=self.group,
                     message_id=current,
@@ -352,20 +352,32 @@ class ChatsMixin:
                     await self.topic(key, self.chat_label(key[5:]))
                 elif previous:
                     await self.topic(key, previous)
-                await self.refresh_chat_controls(key[5:])
+                await self.refresh_chat_controls(key[5:], force=True)
 
-    async def send_buyer(self, event, text, action, *, watermark=True):
+    async def send_buyer(self, event, text, action, *, watermark=True, rendered=False):
         if not text or not self.cfg.flag("SellerStatus", "online"):
             return
         meta = self.state.d.get("chat_meta", {}).get(str(event["chat"]), {})
         event = {**meta, **event}
-        text = self.render(text, event)
+        if not rendered:
+            text = self.render(text, event)
         if watermark and self.cfg.flag("Messages", "watermark"):
-            watermark = self.cfg.get("Messages", "watermark_text").rstrip()
+            watermark = self.render(
+                self.cfg.get("Messages", "watermark_text"), event
+            ).rstrip()
             if watermark:
+                if self.greeting_provider():
+                    watermark = watermark.replace("🤖 FunPay BOT", "👤 ИИ-помощник")
                 text = watermark + "\n" + text
         ok = await self.once(action, lambda: self.fp.send(event["chat"], text))
         if ok:
+            action_logger(action).info(
+                "Сообщение отправлено покупателю · %s",
+                meta.get("username") or "чат " + str(event["chat"]),
+                extra={"plugin_id": action.split(":", 2)[1]}
+                if action.startswith("plugin:")
+                else {},
+            )
             await self.chat_message(
                 "chat:" + str(event["chat"]),
                 self.nick_link(self.seller_name(), event["chat"])
@@ -390,25 +402,36 @@ class ChatsMixin:
             return
         e = dict(e)
         e["chat"] = str(e["chat"])
-        if e["id"] in self.state.d["events"]:
+        if self.state.event_seen(e):
             self.counts["duplicates"] += 1
             LOG.debug("Повторное событие пропущено: %s", e["id"])
             return
+        if e["kind"] == "order":
+            previous_status = (
+                self.state.d.get("ledger", {})
+                .get(e["order_id"], {})
+                .get("handled_status")
+            )
+            if previous_status == e.get("status") or (
+                previous_status == "REFUNDED"
+                or previous_status == "CLOSED"
+                and e.get("status") == "PAID"
+            ):
+                self.state.finish_event(e)
+                self.state.save()
+                return
         self.counts["events"] += 1
         self.last_event = e["kind"] + " · " + e["id"]
-        LOG.info(
-            "Получено событие FunPay: тип=%s, id=%s, чат=%s, продавец=%s, система=%s, бот=%s",
-            e["kind"],
-            e["id"],
-            e["chat"],
-            bool(e.get("seller")),
-            bool(e.get("system")),
-            bool(e.get("by_bot")),
-        )
         key = "chat:" + e["chat"]
         meta = self.state.d.setdefault("chat_meta", {}).setdefault(e["chat"], {})
         if e.get("username"):
             meta["username"] = e["username"]
+        if e.get("chat_name"):
+            meta["chat_name"] = e["chat_name"]
+        if e.get("kind") == "message" and not any(
+            e.get(flag) for flag in ("seller", "system", "by_bot", "employee")
+        ):
+            meta["message_text"] = e.get("message_text", e.get("text", ""))
         if e.get("support_chat"):
             meta["support_chat"] = True
         if e.get("buyer_id"):
@@ -452,7 +475,7 @@ class ChatsMixin:
                     else True,
                 )
                 if e.get("photo"):
-                    await self.tg.call(
+                    await self.telegram_call(
                         "send_photo",
                         chat_id=self.group,
                         message_thread_id=self.state.d["topics"][key],
@@ -464,12 +487,31 @@ class ChatsMixin:
                 and not e.get("system")
                 and not outgoing
             ):
-                self.state.d["last_human"] = time.time()
+                meta["manual_action"] = e["id"]
+                self.record_human_activity("FunPay")
             if not e.get("system") and not e.get("by_bot"):
                 await self.automate_message(e)
         elif e["kind"] == "order":
             FinancialLedger(self.state).observe(e)
-            self.record_order_status(e)
+            archived = e["order_id"] not in self.state.d.get(
+                "order_cards", {}
+            ) and self.state.d["cards"].get("orders/order:" + e["order_id"])
+            if not archived:
+                self.record_order_status(e)
+            elif e["status"] in ("CLOSED", "REFUNDED"):
+                action = "archive:" + e["order_id"] + ":" + e["status"]
+
+                async def append_history():
+                    await self.telegram_call(
+                        "send_message",
+                        chat_id=self.group,
+                        message_thread_id=self.state.d["topics"]["orders"],
+                        reply_to_message_id=archived,
+                        text=f"{self.ORDER_STATUSES[e['status']]} · #{e['order_id']}",
+                        allow_sending_without_reply=True,
+                    )
+
+                await self.once(action, append_history)
             self.state.d.get("completed_order_stats", {}).pop(e["order_id"], None)
             self.state.d["orders"][e["order_id"]] = {**e, "updated_at": time.time()}
             if e["status"] == "PAID":
@@ -527,18 +569,69 @@ class ChatsMixin:
                     await plugin.event(copy.deepcopy(e))
                 except Exception as ex:
                     self.counts["errors"] += 1
-                    logging.getLogger("unified.plugins." + name).exception(
+                    logging.getLogger("FunPayBOT.plugins." + name).exception(
                         "Ошибка обработки события: %s", e["id"]
                     )
         if e["kind"] == "review":
             await self.notify(
                 "review", f"⭐ Отзыв по заказу #{e['order_id']}: {e.get('rating', '—')}"
             )
-        self.capture_debug_event(e)
-        self.state.d["events"][e["id"]] = time.time()
+        self.state.finish_event(e)
+        if e["kind"] == "order":
+            self.state.d["ledger"][e["order_id"]]["handled_status"] = e["status"]
         self.state.save()
         await self.flush_order_cards()
-        LOG.info("Processed %s", self.last_event)
+        self.state.cleanup_completed()
+        self.state.save()
+        self.log_funpay_event(e)
+
+    def record_human_activity(self, source):
+        self.state.d["last_human"] = time.time()
+        self.state.save()
+
+    def log_funpay_event(self, event):
+        kind = event["kind"]
+        if kind == "order":
+            title = {
+                "PAID": "Новый заказ",
+                "CLOSED": "Заказ подтверждён",
+                "REFUNDED": "Возврат по заказу",
+            }.get(event.get("status"), "Изменение заказа")
+            LOG.info(
+                "%s: #%s · %s %s",
+                title,
+                event.get("order_id", "—"),
+                event.get("price", "—"),
+                event.get("currency", ""),
+                extra={"event_source": "FunPay"},
+            )
+        elif kind == "review":
+            LOG.info(
+                "%s: заказ #%s",
+                "Отзыв удалён" if event.get("rating") == 6 else "Новый отзыв",
+                event.get("order_id", "—"),
+                extra={"event_source": "FunPay"},
+            )
+        elif kind == "message":
+            if event.get("by_bot") or event.get("id") in self.state.d.get(
+                "outgoing_messages", {}
+            ):
+                return
+            label = (
+                "Сообщение поддержки"
+                if event.get("employee")
+                else "Системное сообщение FunPay"
+                if event.get("system")
+                else "Сообщение продавца на FunPay"
+                if event.get("seller")
+                else "Новое сообщение"
+            )
+            LOG.info(
+                "%s · %s",
+                label,
+                event.get("username") or event.get("author") or "чат покупателя",
+                extra={"event_source": "FunPay"},
+            )
 
     async def automate_message(self, e):
         if not self.cfg.flag("SellerStatus", "online"):
@@ -552,12 +645,19 @@ class ChatsMixin:
         ):
             if self.cfg.flag("SellerStatus"):
                 stamp = self.state.d["last_human"]
-                status = (
-                    "Последняя активность продавца: " + human_time(self.cfg, stamp)
-                    if stamp
-                    else "Ручных действий продавца ещё не зафиксировано."
+                status = self.render(
+                    self.cfg.get(
+                        "SellerStatus", "active_text" if stamp else "unknown_text"
+                    ),
+                    {
+                        **e,
+                        "last_activity": human_time(self.cfg, stamp) if stamp else "",
+                        "activity_source": "",
+                    },
                 )
-                await self.send_buyer(e, status, "status:" + e["id"], watermark=False)
+                await self.send_buyer(
+                    e, status, "status:" + e["id"], watermark=False, rendered=True
+                )
             return
         if not owner:
             rule = self.response_rules().get(text, {})
@@ -570,18 +670,15 @@ class ChatsMixin:
                 )
                 if rule.get("NOTIFY", True):
                     notice = self.render(
-                        self.cfg.get(
-                            "AUTORESPONSE",
-                            "notification_text",
-                            "Покупатель {username} вызвал автоответ: {command}",
-                        ),
+                        self.cfg.get("AUTORESPONSE", "notification_text"),
                         e,
                     )
-                    await self.notify("autoresponse", notice)
+                    if notice:
+                        await self.notify("autoresponse", notice)
                 return
         if owner:
             return
-        if self.cfg.flag("AUTOGREETINGS"):
+        if self.cfg.flag("AUTOGREETINGS") and self.greeting_provider() is None:
             if (
                 self.cfg.flag("AUTOGREETINGS", "only_new_chats")
                 and e["chat"] in self.baseline

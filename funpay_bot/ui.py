@@ -1,4 +1,4 @@
-"""Ui services."""
+"""Общие функции оформления интерфейса."""
 
 from __future__ import annotations
 
@@ -106,7 +106,7 @@ UI_EMOJI = {
 
 
 def ui_collect_statistics(stats: Mapping[str, Mapping[str, Any]]) -> dict:
-    """Собирает statistics."""
+    """Собирает статистику продаж по переданным данным."""
     from datetime import datetime, timedelta
 
     today_dt = datetime.now(ZoneInfo(UI_TIMEZONE)).date()
@@ -193,7 +193,7 @@ def ui__fit_telegram_ui_text(text: str, limit: int = UI_TEXT_LIMIT) -> str:
 
 
 def ui_format_health_summary(health: Mapping[str, Mapping[str, Any]]) -> str:
-    """Коротко показывает состояние подключённых worker'ов без знания их назначения."""
+    """Кратко показывает состояние подключённых фоновых обработчиков независимо от их назначения."""
     if not health:
         return ""
     rows = []
@@ -216,7 +216,7 @@ def ui_format_main_screen(
     unit: str,
     health: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> str:
-    """Форматирует main screen."""
+    """Формирует текст главного экрана плагина."""
     e = UI_EMOJI
     health_text = ui_format_health_summary(health or {})
     text = (

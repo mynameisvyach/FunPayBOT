@@ -1,4 +1,4 @@
-"""Shared commerce state machine and supplier orchestration."""
+"""Общая машина состояний заказов и взаимодействие с адаптерами поставщиков."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ from .ui import ui_button, ui_format_main_screen
 
 
 class CommerceRuntime:
-    """Provider-neutral order runtime shared by native auto plugins."""
+    """Обрабатывает торговые заказы независимо от конкретного поставщика."""
 
     DEFAULTS = {}
 
@@ -38,7 +38,7 @@ class CommerceRuntime:
         self.app = ctx.app
         self.id = ctx.id
         self.log = getattr(
-            ctx, "logger", logging.getLogger("unified.plugins." + self.id)
+            ctx, "logger", logging.getLogger("FunPayBOT.plugins." + self.id)
         )
         self.path = self.app.cfg.path.parent / "plugins" / self.id / "config.json"
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -112,14 +112,14 @@ class CommerceRuntime:
                 order["retry_due"] = time.time() + 30
             elif order["phase"] == "delivery_check" and self.RECOVER_DELIVERY_CHECK:
                 order["phase"] = "verifying"
-        self.log.info(
+        self.save()
+        await self.menu()
+        self.log.debug(
             "Плагин запущен: автоматическая выдача=%s, демпер=%s, сохранённых операций=%s",
             self.flag("enabled"),
             self.flag("autodump"),
             len(self.state["orders"]),
         )
-        self.save()
-        await self.menu()
 
     async def stop(self):
         for task in self.tasks.values():
@@ -155,7 +155,7 @@ class CommerceRuntime:
         }
 
     def ui_statistics(self):
-        stats = copy.deepcopy(self.state.get("legacy_stats", {}))
+        stats = copy.deepcopy(self.state.get("historical_statistics", {}))
         for key, row in self.app.state.d["ledger"].items():
             if row["source"] != self.id or not row.get("delivery_accounted"):
                 continue
@@ -196,7 +196,7 @@ class CommerceRuntime:
             self.validate_credentials()
         except (ValueError, TypeError):
             configured = False
-        if configured and self.app.fp.mode != "demo":
+        if configured:
             try:
                 value = Decimal(str(await self.provider_balance()))
                 self.observe_balance(value)
@@ -229,11 +229,10 @@ class CommerceRuntime:
         enabled = self.flag("enabled")
         rows = [
             [
-                ui_button(
-                    "Выдача " + ("🟢 включена" if enabled else "⚪ выключена"),
-                    "toggle",
-                    "start" if not enabled else "stop",
-                )
+                {
+                    "text": "Выдача " + ("включена" if enabled else "выключена"),
+                    "callback_data": "toggle",
+                }
             ],
             [
                 ui_button("Прямая закупка", "direct", "unit"),
@@ -241,7 +240,9 @@ class CommerceRuntime:
             ],
             [ui_button("Закрыть", "close", "stop")],
         ]
-        await self.ctx.card(text, rows, parse_mode="HTML", new_message=new_message)
+        await self.ctx.card(
+            text, rows, parse_mode="HTML", new_message=new_message, main_menu=True
+        )
         for order in self.state["orders"].values():
             if order["phase"] == "awaiting_sale_amount":
                 await self.prompt_direct_sale(order)
@@ -293,9 +294,6 @@ class CommerceRuntime:
         self.save_config()
 
     async def callback(self, action, user):
-        self.log.info(
-            "Действие меню: %s; администратор=%s", action.split(":", 1)[0], user
-        )
         if self.is_host_only_action(action):
             return
         if action == "menu":
@@ -547,11 +545,8 @@ class CommerceRuntime:
                 self.save_config()
                 self.save()
                 await self.refresh_stock()
-                await self.ctx.publish_rates(
-                    f"{self.TITLE}\nСредний курс закупки: {self.get('purchase_rate_rub')} ₽/USDT"
-                )
                 await self.ctx.say(
-                    f"Пополнение учтено: {units:.6f} USDT за {cost:.2f} ₽.\nКурс пополнения: {cost / units:.4f} ₽/USDT.\nСредний курс запаса: {self.get('purchase_rate_rub')} ₽/USDT."
+                    f"Пополнение учтено: {units:.3f} USDT за {cost:.3f} ₽."
                 )
             elif action == "topup":
                 units_raw, cost_raw = text.split()
@@ -706,7 +701,7 @@ class CommerceRuntime:
                     o["phase"] = "refunded"
                 self.save()
                 return
-            if key in self.state.get("legacy_seen_orders", []):
+            if key in self.state.get("blocked_order_ids", []):
                 return
             if (
                 not o
@@ -871,7 +866,7 @@ class CommerceRuntime:
                     self.log.exception(
                         "Ошибка проверки состояния оплаты/выдачи: заказ=%s", key
                     )
-        if self.flag("enabled") and self.app.fp.mode != "demo":
+        if self.flag("enabled"):
             try:
                 self.validate_credentials()
             except (ValueError, TypeError) as error:
@@ -883,11 +878,7 @@ class CommerceRuntime:
             if getattr(self, "credential_error", None):
                 self.log.info("Настройки поставщика прошли проверку")
             self.credential_error = None
-        if (
-            self.flag("enabled")
-            and self.app.fp.mode != "demo"
-            and now - self.last_balance >= 60
-        ):
+        if self.flag("enabled") and now - self.last_balance >= 60:
             self.last_balance = now
             try:
                 self.validate_credentials()
@@ -936,11 +927,6 @@ class CommerceRuntime:
                 o.get("packs", 1),
                 bool(o.get("direct")),
             )
-            if self.app.fp.mode == "demo":
-                o["phase"] = "manual"
-                o["error"] = "Демонстрационный режим: внешние закупки заблокированы"
-                self.save()
-                return
             try:
                 self.validate_credentials()
                 if not o.get("direct"):
@@ -1147,20 +1133,16 @@ class CommerceRuntime:
             await self.prompt_direct_sale(o)
             return
         if not o.get("customer_refunded"):
-            action = f"plugin:{self.id}:" + o["order_id"] + ":done"
-            self.app.state.d.setdefault("notification_outbox", {}).setdefault(
-                action,
-                {
-                    "event": copy.deepcopy(o["event"]),
-                    "text": self.buyer_receipt(o),
-                    "action": action,
-                    "status": "retry",
-                    "due": time.time(),
-                    "attempts": 0,
+            await self.ctx.fulfilled(
+                o["event"],
+                details={
+                    "recipient": o.get("recipient", ""),
+                    "quantity": int(o["quantity"]) * int(o.get("packs", 1)),
+                    "product": getattr(self, "PRODUCT_LABEL", ""),
+                    "reference": self.operation_reference(o),
+                    "receipt_url": self.receipt_url(o) or "",
                 },
             )
-            self.save()
-            await self.ctx.fulfilled(o["event"])
         o["phase"] = "done"
         self.save()
         quantity = o["quantity"] * o.get("packs", 1)
@@ -1205,7 +1187,7 @@ class CommerceRuntime:
         )
         self.save()
         self.log.info(
-            "Provider %s order=%s delivered quantity=%s cost=%s profit=%s",
+            "Плагин %s: заказ #%s выполнен · количество %s · расходы %s ₽ · прибыль %s ₽",
             self.id,
             o["order_id"],
             quantity,
@@ -1217,7 +1199,14 @@ class CommerceRuntime:
         return None
 
     def buyer_receipt(self, o):
-        return f"✅ Заказ #{o['order_id']} выполнен. Получатель: {o['recipient']}. Подтверждение поставщика: {o.get('reference', o['order_id'])}."
+        return self.app.completion_message(
+            o["event"],
+            {
+                "recipient": o.get("recipient", ""),
+                "reference": self.operation_reference(o),
+                "receipt_url": self.receipt_url(o) or "",
+            },
+        )
 
     def observe_balance(self, value):
         value = Decimal(str(value))
@@ -1431,7 +1420,7 @@ class CommerceRuntime:
 
 
 class CommercePlugin(FrameworkPlugin, CommerceRuntime):
-    """One composition root for any supplier/product pair; non-commerce plugins use FrameworkPlugin."""
+    """Объединяет поставщика и товар; неторговые расширения используют FrameworkPlugin."""
 
     PROVIDER = None
     PRODUCT = None
@@ -1531,7 +1520,7 @@ class CommercePlugin(FrameworkPlugin, CommerceRuntime):
         self.configure_runtime()
 
     def configure_runtime(self):
-        """Optional plugin extension point for additional components, routes and workers."""
+        """Подключает дополнительные компоненты, маршруты и фоновые задачи плагина."""
 
     def validate_credentials(self):
         return self.provider.validate_credentials()
@@ -1555,7 +1544,14 @@ class CommercePlugin(FrameworkPlugin, CommerceRuntime):
         return await self.product.buyer_command(event)
 
     def buyer_receipt(self, order):
-        return self.product.buyer_receipt(order)
+        return self.app.completion_message(
+            order["event"],
+            {
+                "recipient": order.get("recipient", ""),
+                "reference": self.operation_reference(order),
+                "receipt_url": self.receipt_url(order) or "",
+            },
+        )
 
     async def provider_balance(self):
         return await self.provider.provider_balance()

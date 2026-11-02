@@ -1,4 +1,4 @@
-"""Scheduler application handlers."""
+"""Планировщик заданий и отметка выполнения заказов."""
 
 from __future__ import annotations
 
@@ -34,19 +34,58 @@ class SchedulerMixin:
                 "due": time.time() + self.cfg.number(section, "delay_hours", 24) * 3600,
             }
 
-    async def fulfilled(self, e, *, plugin_id=None, manual_user=None):
+    def completion_message(self, event, details=None):
+        values = {**event, **(details or {})}
+        text = self.render(self.cfg.get("Fulfillment", "text"), values).strip()
+        if not text:
+            return ""
+        if details and (details.get("receipt_url") or details.get("reference")):
+            receipt = self.render(
+                self.cfg.get("Fulfillment", "receipt_text"), values
+            ).strip()
+            if receipt:
+                text = text + "\n\n" + receipt if text else receipt
+        return text
+
+    async def fulfilled(self, e, *, plugin_id=None, manual_user=None, details=None):
         row = self.state.d.get("order_cards", {}).get(e["order_id"])
-        if (
-            not row
-            or row.get("refund_pending")
+        if row and (
+            row.get("refund_pending")
             or row.get("status") == "REFUNDED"
             or row.get("fulfilled")
         ):
+            return
+        if not row and not plugin_id:
             return
         if plugin_id:
             if not self.claim_order(plugin_id, e):
                 return
         elif manual_user is None or row.get("plugin"):
+            return
+        text = self.completion_message(e, details)
+        if not text:
+            raise ValueError(
+                "Задайте текст выполнения заказа в настройках: Автоматизация → Сообщение о выполнении"
+            )
+        action = (
+            f"plugin:{plugin_id}:{e['order_id']}:done"
+            if plugin_id
+            else "fulfillment:" + e["order_id"]
+        )
+        self.state.d.setdefault("notification_outbox", {}).setdefault(
+            action,
+            {
+                "event": copy.deepcopy(e),
+                "text": text,
+                "action": action,
+                "status": "retry",
+                "due": time.time(),
+                "attempts": 0,
+            },
+        )
+        if row is None:
+            self.state.save()
+            await self.notification_outbox_tick(time.time())
             return
         row["fulfilled"] = {
             "at": time.time(),
@@ -69,6 +108,12 @@ class SchedulerMixin:
             row["event"],
         )
         self.state.save()
+        LOG.info(
+            "Заказ #%s выполнен%s",
+            e["order_id"],
+            " плагином " + plugin_id if plugin_id else " вручную",
+        )
+        await self.notification_outbox_tick(time.time())
 
     async def tick(self):
         async with self.lock:
@@ -76,11 +121,21 @@ class SchedulerMixin:
             await self.flush_order_cards()
             await self.release_tick()
             await self.flush_order_cards()
+            self.state.cleanup_completed(now)
+            self.state.save()
             if self.cfg.flag("SellerStatus", "online"):
                 for key, job in list(self.state.d["jobs"].items()):
                     row = self.state.d.get("order_cards", {}).get(
                         job["event"]["order_id"], {}
                     )
+                    if not row and job["section"] == "REVIEWREMINDER":
+                        row = {
+                            "fulfilled": True,
+                            "event": job["event"],
+                            "status": self.state.d.get("ledger", {})
+                            .get(job["event"]["order_id"], {})
+                            .get("status"),
+                        }
                     if not row.get("fulfilled"):
                         del self.state.d["jobs"][key]
                         self.state.save()
@@ -139,6 +194,9 @@ class SchedulerMixin:
                 if self.cfg.flag("AutoRaise") and now >= self.state.d.get(
                     "raise_scan", 0
                 ):
+                    # Не опрашиваем профиль каждые две секунды при временном сбое.
+                    self.state.d["raise_scan"] = now + 60
+                    self.state.save()
                     for category in await self.fp.categories():
                         if now < self.state.d["raise_due"].get(str(category), 0):
                             continue
@@ -149,11 +207,7 @@ class SchedulerMixin:
                             )
                         except Exception as e:
                             wait = getattr(e, "wait_time", None) or 300
-                            LOG.warning(
-                                "Raise category=%s failed: %s",
-                                category,
-                                type(e).__name__,
-                            )
+                            # FunPayClient уже зарегистрировал ошибку с её исходным контекстом.
                         self.state.d["raise_due"][str(category)] = now + max(
                             60,
                             float(
@@ -166,7 +220,13 @@ class SchedulerMixin:
                         self.state.save()
                     self.state.d["raise_scan"] = now + 60
                     self.state.save()
-            if self.cfg.flag("Rates") and now >= self.state.d.get("rates_due", 0):
+            first_rates = not self.rates_created and not getattr(
+                self, "rates_startup_attempted", False
+            )
+            if self.cfg.flag("Rates") and (
+                first_rates or now >= self.state.d.get("rates_due", 0)
+            ):
+                self.rates_startup_attempted = True
                 self.state.d["rates_due"] = now + max(
                     60, self.cfg.number("Rates", "interval_seconds", 3600)
                 )
@@ -185,8 +245,3 @@ class SchedulerMixin:
                 await self.report()
                 self.state.d["report_week"] = week
                 self.state.save()
-            if self.debug and now - self.last_debug >= max(
-                5, self.cfg.number("Debug", "refresh_seconds", 10)
-            ):
-                self.last_debug = now
-                await self.debug_card()

@@ -1,4 +1,4 @@
-"""Plugin contracts, context, routing and lifecycle."""
+"""Контракты плагинов, контекст, маршрутизация и жизненный цикл."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from .storage import atomic_write
 
 
 class PluginConfigStore:
-    """JSON settings; a ConfigParser facade keeps old plugin field declarations usable."""
+    """Хранит JSON-настройки и предоставляет доступ к разделам через ConfigParser."""
 
     def __init__(self, path, defaults=None):
         self.path = Path(path).with_suffix(".json")
@@ -36,7 +36,7 @@ PLUGIN_SECRET_FIELDS = {}
 
 
 class CallbackRouter:
-    """Per-plugin routes; the host supplies authorization and topic isolation."""
+    """Хранит маршруты плагина; авторизацию и разделение тем обеспечивает ядро."""
 
     def __init__(self):
         self.exact = {}
@@ -72,7 +72,7 @@ class CallbackRouter:
 
 
 class PluginRuntime:
-    """Generic lifecycle, components, capabilities, hooks and owned async workers."""
+    """Управляет жизненным циклом, компонентами, обработчиками и асинхронными задачами плагина."""
 
     def __init__(self, ctx):
         self.ctx = ctx
@@ -83,6 +83,12 @@ class PluginRuntime:
         self.tasks = {}
         self.health = {}
         self.started = False
+        self.ready = False
+        self.initializing = False
+        self.prepared = False
+        self.initialization_error = None
+        self.initialization_complete = asyncio.Event()
+        self.start_gate = getattr(ctx.app, "_plugin_start_gate", None)
         self.generation = ActivityGeneration()
         self.timers = TimerRegistry()
         self.queue = SerialTaskQueue()
@@ -92,7 +98,7 @@ class PluginRuntime:
             .setdefault("_runtime", {})
         )
         self.log = getattr(
-            ctx, "logger", logging.getLogger("unified.plugins." + ctx.id)
+            ctx, "logger", logging.getLogger("FunPayBOT.plugins." + ctx.id)
         )
 
     def register(self, name, component):
@@ -115,7 +121,8 @@ class PluginRuntime:
             if inspect.isawaitable(value):
                 await value
 
-    def start_worker(self, name, worker):
+    def start_worker(self, name, worker, *, initialization=False):
+        """Запускает подготовку сразу, а рабочие задачи — после общего разрешения ядра."""
         existing = self.tasks.get(name)
         if existing and not existing.done():
             return existing
@@ -123,18 +130,69 @@ class PluginRuntime:
 
         async def run():
             try:
+                if not initialization:
+                    await self.wait_running()
                 await worker()
+                if initialization and not self.prepared:
+                    self.initialization_error = RuntimeError(
+                        "Подготовка плагина завершилась без подтверждения готовности"
+                    )
+                    self.initialization_complete.set()
                 self.health[name]["at"] = time.time()
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 self.health[name]["error"] = type(error).__name__
+                if initialization and not self.prepared:
+                    self.initialization_error = error
+                    self.initialization_complete.set()
                 self.log.exception("Ошибка задачи %s", name)
             finally:
                 self.health[name]["running"] = False
 
         self.tasks[name] = asyncio.create_task(run(), name=self.ctx.id + ":" + name)
         return self.tasks[name]
+
+    def begin_initialization(self, message="Инициализация..."):
+        """Показывает один старт и сбрасывает готовность компонента."""
+        if self.initializing and not self.ready:
+            return
+        self.ready = False
+        self.prepared = False
+        self.initialization_error = None
+        self.initialization_complete.clear()
+        self.initializing = True
+        self.log.info("Инициализация...")
+
+    def mark_ready(self):
+        """Подтверждает подготовку; объявляет готовность только после общего этапа инициализации."""
+        self.prepared = True
+        self.initialization_complete.set()
+        if self.start_gate is None or self.start_gate.is_set():
+            self.activate()
+
+    def activate(self):
+        """Завершает инициализацию одним сообщением после разрешения общего запуска."""
+        if self.started and self.prepared and not self.ready:
+            self.ready = True
+            self.initializing = False
+            self.log.info("Готов к работе")
+
+    async def wait_running(self):
+        """Удерживает рабочие задачи до завершения подготовки всех плагинов."""
+        if self.start_gate is not None:
+            await self.start_gate.wait()
+
+    async def wait_prepared(self, timeout=90):
+        """Дожидается готовности либо возвращает исходную ошибку подготовки."""
+        try:
+            await asyncio.wait_for(self.initialization_complete.wait(), timeout)
+        except TimeoutError:
+            raise RuntimeError(
+                "Истекло время подготовки плагина " + self.ctx.id
+            ) from None
+        if self.initialization_error is not None:
+            raise self.initialization_error
 
     async def start(self):
         if self.started:
@@ -154,6 +212,10 @@ class PluginRuntime:
                 await self.emit("stop")
         finally:
             self.started = False
+            self.ready = False
+            self.initializing = False
+            self.prepared = False
+            self.initialization_complete.clear()
             self.generation.advance()
             self.queue.close()
             await self.timers.close()
@@ -165,7 +227,7 @@ class PluginRuntime:
 
 
 class FrameworkPlugin:
-    """A plugin may expose any components; commerce/provider APIs are optional."""
+    """Базовый класс расширения; торговые функции и API поставщика необязательны."""
 
     def __init__(self, ctx):
         self.ctx = ctx
@@ -177,7 +239,12 @@ class FrameworkPlugin:
         }
 
     async def start(self):
+        if self.runtime.started:
+            return
+        self.runtime.begin_initialization("Инициализация...")
         await self.runtime.start()
+        if not getattr(self, "DEFER_READY", False):
+            self.runtime.mark_ready()
 
     async def stop(self):
         await self.runtime.stop()
@@ -200,7 +267,7 @@ class FrameworkPlugin:
 
 
 class BoundComponent:
-    """Explicit reference to its composition root; no global plugin state."""
+    """Связывает компонент с экземпляром плагина без глобального состояния."""
 
     def __init__(self, plugin):
         self.plugin = plugin
@@ -210,7 +277,7 @@ class BoundComponent:
 
 
 class ProviderAdapter(BoundComponent):
-    """Supplier-specific API and validation live in the plugin, not the host."""
+    """Определяет контракт API поставщика; его запросы и проверки реализует плагин."""
 
     REQUIRED_FIELDS = ()
     FIELD_VALIDATORS = {}
@@ -265,7 +332,7 @@ class ProviderAdapter(BoundComponent):
 
 
 class ProductAdapter(BoundComponent):
-    """Shared parsing and buyer command flow; all product rules are declarations."""
+    """Разбирает данные и команды покупателя по правилам, объявленным товарным плагином."""
 
     QUANTITY_PATTERNS = ()
     RECIPIENT_PATTERN = None
@@ -320,7 +387,7 @@ class ProductAdapter(BoundComponent):
 
 
 class SettingsSchema:
-    """Field types and constraints are declared by the plugin, never guessed by key."""
+    """Описывает типы и ограничения полей, явно заданные плагином."""
 
     @staticmethod
     def validate(descriptor, text):
@@ -391,7 +458,7 @@ def load_plugin_module(name):
     if not re.fullmatch(r"[a-z][a-z0-9_]{0,23}", name):
         raise ValueError("Некорректное имя плагина")
     spec = importlib.util.spec_from_file_location(
-        "unified_plugin_" + name, ROOT / "plugins" / (name + ".py")
+        "funpaybot_plugin_" + name, ROOT / "plugins" / (name + ".py")
     )
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -402,7 +469,7 @@ def load_plugin_module(name):
 
 
 class PluginContext:
-    """Trusted Python plugins, not a sandbox. UI routing is enforced by the core."""
+    """Предоставляет контекст доверенному плагину; маршрутизацию интерфейса контролирует ядро."""
 
     def __init__(self, app, plugin_id):
         from .logging_setup import plugin_logger
@@ -425,7 +492,9 @@ class PluginContext:
     async def say(self, text):
         await self.app.say("plugin:" + self.id, text)
 
-    async def card(self, text, buttons=(), *, parse_mode=None, new_message=False):
+    async def card(
+        self, text, buttons=(), *, parse_mode=None, new_message=False, main_menu=False
+    ):
         rows = []
         for row in buttons:
             converted = []
@@ -439,6 +508,53 @@ class PluginContext:
                     label, action = cell
                     converted.append((label, f"{self.id}:{action}"))
             rows.append(converted)
+        if not main_menu:
+            rows = [
+                [
+                    cell
+                    for cell in row
+                    if (
+                        cell.get("callback_data", "")
+                        if isinstance(cell, dict)
+                        else cell[1]
+                    ).split(":")[-1]
+                    != "close"
+                ]
+                for row in rows
+            ]
+            rows = [row for row in rows if row]
+            has_back = False
+            for row in rows:
+                for index, cell in enumerate(row):
+                    label = cell.get("text", "") if isinstance(cell, dict) else cell[0]
+                    action = (
+                        cell.get("callback_data", "")
+                        if isinstance(cell, dict)
+                        else cell[1]
+                    )
+                    if label.startswith(("‹", "<")) or label in ("Отмена", "Назад"):
+                        target = action.split(":", 1)[-1].split(":", 1)[0]
+                        title = {
+                            "menu": "Меню",
+                            "knowledge": "База знаний",
+                            "questions": "Вопросы",
+                            "settings": "Настройки",
+                            "lot": "Товар",
+                            "question": "Вопрос",
+                        }.get(
+                            target,
+                            label.lstrip("‹< ")
+                            if label not in ("Отмена", "Назад")
+                            else "Меню",
+                        )
+                        replacement = "< " + title
+                        if isinstance(cell, dict):
+                            cell["text"] = replacement
+                        else:
+                            row[index] = (replacement, action)
+                        has_back = True
+            if not has_back:
+                rows.append([("< Меню", self.id + ":menu")])
         await self.app.card(
             "plugin:" + self.id,
             "menu",
@@ -446,13 +562,15 @@ class PluginContext:
             rows,
             parse_mode=parse_mode,
             new_message=new_message,
+            plugin_main=main_menu,
         )
 
     async def notify_main(self, text):
         await self.app.say("main", text)
 
     async def publish_rates(self, text):
-        await self.app.publish_rates_card("🤑 Актуальные курсы\n" + text)
+        """Обновляет общую карточку только рыночными данными CoinGecko."""
+        await self.app.rates(force=True)
 
     async def publish_report(self, text):
         # Plugins contribute to the common report, never publish separate reports.
@@ -462,8 +580,15 @@ class PluginContext:
         }
         self.app.state.save()
 
-    async def send_buyer(self, event, text, action_id):
-        await self.app.send_buyer(event, text, f"plugin:{self.id}:{action_id}")
+    def render(self, text, event):
+        """Подставляет общие переменные сообщения или заказа в шаблон плагина."""
+        return self.app.render(text, event)
+
+    async def send_buyer(self, event, text, action_id, *, rendered=False):
+        """Отправляет шаблон или готовый текст через общий журнал защиты от повторов."""
+        await self.app.send_buyer(
+            event, text, f"plugin:{self.id}:{action_id}", rendered=rendered
+        )
 
     async def claim_order(self, event):
         result = self.app.claim_order(self.id, event)
@@ -475,8 +600,8 @@ class PluginContext:
             self.app.record_order_progress(event["order_id"], phase, description)
             self.app.state.save()
 
-    async def fulfilled(self, event):
-        await self.app.fulfilled(event, plugin_id=self.id)
+    async def fulfilled(self, event, *, details=None):
+        await self.app.fulfilled(event, plugin_id=self.id, details=details)
 
     async def file(self, name, body):
         await self.app.tg.call(

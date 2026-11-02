@@ -1,1 +1,1 @@
-"""Application handlers grouped by responsibility."""
+"""Обработчики приложения, сгруппированные по назначению."""

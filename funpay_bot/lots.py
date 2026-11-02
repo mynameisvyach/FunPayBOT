@@ -1,4 +1,4 @@
-"""Lots services."""
+"""Профили лотов и общий сервис изменения цен."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ class ManagedLot:
 
 @dataclass(frozen=True)
 class LotProfile:
-    """Plugin-to-worker contract for compact quantities and explicit lot descriptors."""
+    """Описывает данные лотов, которые плагин передаёт общему обработчику."""
 
     owner: str
     category_id: int
@@ -61,7 +61,7 @@ class LotProfile:
 
 
 class CoreLotDumper:
-    """Internal worker called by plugin commerce runtimes. No UI or independent schedule."""
+    """Внутренний обработчик лотов; вызывается торговым механизмом без отдельного меню и расписания."""
 
     def __init__(self, app):
         self.app = app
